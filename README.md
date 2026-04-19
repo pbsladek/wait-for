@@ -14,6 +14,9 @@ without progress lines so it is safe to consume from scripts.
 waitfor http https://api.example.com/health --status 200
 waitfor http https://api.example.com/health --status 200 --body-contains ok
 waitfor tcp localhost:5432
+waitfor dns api.example.com --type A --min-count 1
+waitfor dns api.example.com --resolver wire --server 1.1.1.1 --type HTTPS --rcode NOERROR
+waitfor docker my-container --status running --health healthy
 waitfor file /tmp/ready.flag exists
 waitfor file /tmp/lock deleted
 waitfor exec --output-contains Running -- kubectl get pod myapp
@@ -70,6 +73,17 @@ belongs to the command:
 waitfor exec --output-contains ready -- /bin/sh -c 'printf ready'
 ```
 
+DNS uses Go's standard resolver by default. `--resolver system` is portable and
+supports `A`, `AAAA`, `CNAME`, `TXT`, and `ANY`, including absence checks where
+"not found" is enough. Use `--resolver wire --server ADDRESS` for lower-level
+DNS checks that need exact response codes, NXDOMAIN vs NODATA absence modes,
+transport selection, EDNS0, or record types such as `MX`, `SRV`, `NS`, `CAA`,
+`HTTPS`, and `SVCB`.
+
+Docker polling shells out to the Docker CLI and inspects container state. A
+missing Docker binary is fatal; missing containers or containers in the wrong
+state remain retryable until the timeout.
+
 ## JSON Expressions
 
 The first implementation intentionally supports a small expression subset:
@@ -110,7 +124,9 @@ prefer `backend` and `target` over parsing the human-readable `name`.
 CLI parsing is intentionally separate from the backend implementations. That
 keeps backends testable without Cobra and makes multi-condition parsing a narrow
 concern. Kubernetes uses a getter abstraction so tests can use client-go fakes
-and production can use the dynamic client.
+and production can use the dynamic client. DNS follows the same split: ordinary
+lookups use the standard library, while `--resolver wire` opts into
+`codeberg.org/miekg/dns` v2 for message-level behavior.
 
 ## Development Plan
 
@@ -132,4 +148,6 @@ The project targets Go 1.26 and pins the toolchain to Go 1.26.2.
 ```bash
 make test
 make build
+golangci-lint run
+gocyclo -over 9 $(find . -name '*.go' -not -name '*_test.go')
 ```

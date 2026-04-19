@@ -9,7 +9,7 @@ init containers, and agent workflows.
 ```
 cmd/waitfor/        entrypoint — signal handling, delegates to internal/cli
 internal/cli/       argument parsing, backend wiring, exit codes
-internal/condition/ one file per backend: http, tcp, file, exec, k8s
+internal/condition/ one file per backend: http, tcp, dns, docker, file, exec, k8s
 internal/runner/    polling loop — timeout, interval, all/any, parallelism
 internal/output/    text/JSON formatters (progress → stderr, JSON → stdout)
 internal/expr/      minimal JSONPath evaluator used by http, exec, and k8s
@@ -29,6 +29,7 @@ Always run before finishing any change:
 
 ```bash
 go build ./... && go test ./... && golangci-lint run
+gocyclo -over 9 $(find . -name '*.go' -not -name '*_test.go')
 ```
 
 ## Core interface
@@ -106,9 +107,13 @@ Established extraction patterns to follow:
 | `condition/exec` | `checkExecOutput`            | `ExecCondition.Check`         |
 | `condition/k8s`  | `validateK8sResource`        | `KubernetesCondition.Check`   |
 | `condition/k8s`  | `checkK8sNamedCondition`     | `KubernetesCondition.Check`   |
+| `condition/dns`  | `checkRCode`                 | `DNSCondition.evaluate`       |
+| `condition/dns`  | `checkPresentValues`         | `DNSCondition.evaluate`       |
 | `cli`            | `parseBodyContent`           | `parseHTTPCondition`          |
 | `cli`            | `parseHTTPHeaders`           | `parseHTTPCondition`          |
 | `cli`            | `applyFormatAndMode`         | `parseGlobal`                 |
+| `cli`            | `validateDNSAbsentOptions`   | `validateDNSWireOptions`      |
+| `cli`            | `validateDNSTransportOptions` | `validateDNSWireOptions`      |
 
 ## Adding a backend
 
@@ -145,10 +150,19 @@ Established extraction patterns to follow:
 - **Kubernetes uses a `KubernetesGetter` interface.** Production code uses the
   dynamic client; tests inject a `fake.NewSimpleDynamicClient`. Do not call the
   real API in unit tests.
+- **DNS has two resolver modes.** `system` uses the Go standard library and
+  should remain the default for portable A/AAAA/CNAME/TXT/ANY checks. `wire`
+  uses `codeberg.org/miekg/dns` v2 for message-level behavior such as response
+  codes, NXDOMAIN vs NODATA, EDNS0, transport selection, and MX/SRV/NS/CAA/
+  HTTPS/SVCB records. Keep wire-only behavior behind `--resolver wire`.
+- **Docker uses the Docker CLI boundary.** Missing Docker is fatal because
+  retries cannot fix it. Missing containers, inspect failures, and state or
+  health mismatches are retryable unless the configuration itself is invalid.
 - **`expr` stays minimal.** The JSONPath evaluator covers the subset needed by
   `--jsonpath`. Do not add operators or syntax without a concrete use case.
 - **No new dependencies** unless the stdlib and existing deps genuinely cannot
-  solve the problem.
+  solve the problem. Prefer opt-in dependency paths when only advanced behavior
+  needs the dependency, as with DNS wire mode.
 
 ## Testing patterns
 
@@ -180,10 +194,19 @@ _, err := parseKubernetesCondition([]string{"k8s", "pod/a", "--jsonpath", " "})
 // err must be non-nil (blank jsonpath fails compilation)
 ```
 
+### Integration tests
+Black-box tests in `integration/blackbox_test.go` compile and execute the real
+binary when `WAITFOR_BLACKBOX=1` is set. Kubernetes cases additionally require
+`WAITFOR_BLACKBOX_K8S=1` and a real cluster context. Keep Kubernetes tests
+skipped by default so `go test ./...` does not require Docker, kind, or a
+cluster.
+
 ## Common mistakes to avoid
 
 - Returning `Fatal` for a network timeout — use `Unsatisfied` so the runner
   retries. Only use `Fatal` when retrying is pointless.
+- Treating DNS `NXDOMAIN` and `NODATA` as distinguishable in `system` resolver
+  mode — use `wire` mode when precise response classification is required.
 - Blocking in `Check` after `ctx.Done()` fires — the runner will not cancel a
   goroutine that ignores context; it will hang until the global timeout.
 - Writing to stdout from a backend — all output is the runner's responsibility.
