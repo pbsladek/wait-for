@@ -247,6 +247,10 @@ func parseCondition(segment []string) (condition.Condition, error) {
 		return parseFileCondition(segment)
 	case "k8s":
 		return parseKubernetesCondition(segment)
+	case "dns":
+		return parseDNSCondition(segment)
+	case "docker":
+		return parseDockerCondition(segment)
 	default:
 		return nil, fmt.Errorf("unknown backend %q", segment[0])
 	}
@@ -388,6 +392,256 @@ func parseTCPCondition(segment []string) (condition.Condition, error) {
 		return nil, fmt.Errorf("invalid tcp address %q: %w", args[0], err)
 	}
 	return condition.NewTCP(args[0]), nil
+}
+
+type dnsParseOptions struct {
+	recordType   string
+	resolverMode string
+	contains     string
+	equals       []string
+	minCount     int
+	absent       bool
+	absentMode   string
+	server       string
+	rcode        string
+	transport    string
+	edns0        bool
+	udpSize      int
+}
+
+func parseDNSCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("dns", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	opts := dnsParseOptions{
+		recordType:   string(condition.DNSRecordA),
+		resolverMode: string(condition.DNSResolverSystem),
+		absentMode:   string(condition.DNSAbsentAny),
+		transport:    string(condition.DNSTransportUDP),
+	}
+	fs.StringVar(&opts.recordType, "type", opts.recordType, "DNS record type: A|AAAA|CNAME|TXT|ANY|MX|SRV|NS|CAA|HTTPS|SVCB")
+	fs.StringVar(&opts.resolverMode, "resolver", opts.resolverMode, "resolver mode: system|wire")
+	fs.StringVar(&opts.contains, "contains", opts.contains, "required record substring")
+	fs.StringArrayVar(&opts.equals, "equals", nil, "required exact record value; repeatable")
+	fs.IntVar(&opts.minCount, "min-count", opts.minCount, "minimum answer count")
+	fs.BoolVar(&opts.absent, "absent", opts.absent, "wait until the record is absent")
+	fs.StringVar(&opts.absentMode, "absent-mode", opts.absentMode, "wire absence mode: any|nxdomain|nodata")
+	fs.StringVar(&opts.server, "server", opts.server, "DNS server address; port defaults to 53")
+	fs.StringVar(&opts.rcode, "rcode", opts.rcode, "wire response code, such as NOERROR or NXDOMAIN")
+	fs.StringVar(&opts.transport, "transport", opts.transport, "wire transport: udp|tcp")
+	fs.BoolVar(&opts.edns0, "edns0", opts.edns0, "enable EDNS0 for wire resolver")
+	fs.IntVar(&opts.udpSize, "udp-size", opts.udpSize, "wire EDNS0 UDP payload size")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	args := fs.Args()
+	if len(args) != 1 {
+		return nil, fmt.Errorf("dns requires exactly one HOST")
+	}
+	opts, serverAddr, err := normalizeDNSOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+	cond := condition.NewDNS(args[0])
+	cond.RecordType = condition.DNSRecordType(opts.recordType)
+	cond.ResolverMode = condition.DNSResolverMode(opts.resolverMode)
+	cond.Contains = opts.contains
+	cond.Equals = opts.equals
+	cond.MinCount = opts.minCount
+	cond.Absent = opts.absent
+	cond.AbsentMode = condition.DNSAbsentMode(opts.absentMode)
+	cond.Server = serverAddr
+	cond.RCode = strings.ToUpper(opts.rcode)
+	cond.Transport = condition.DNSTransport(opts.transport)
+	cond.EDNS0 = opts.edns0
+	cond.UDPSize = uint16(opts.udpSize)
+	return cond, nil
+}
+
+func normalizeDNSOptions(opts dnsParseOptions) (dnsParseOptions, string, error) {
+	opts.recordType = strings.ToUpper(opts.recordType)
+	if !validDNSRecordType(condition.DNSRecordType(opts.recordType)) {
+		return opts, "", fmt.Errorf("invalid dns record type %q", opts.recordType)
+	}
+	opts.resolverMode = strings.ToLower(opts.resolverMode)
+	if err := validateDNSResolverMode(opts.resolverMode, condition.DNSRecordType(opts.recordType)); err != nil {
+		return opts, "", err
+	}
+	if err := validateDNSMatchers(opts); err != nil {
+		return opts, "", err
+	}
+	opts.absentMode = strings.ToLower(opts.absentMode)
+	opts.transport = strings.ToLower(opts.transport)
+	if err := validateDNSWireOptions(opts); err != nil {
+		return opts, "", err
+	}
+	serverAddr, err := parseDNSServer(opts.server)
+	if err != nil {
+		return opts, "", err
+	}
+	if opts.resolverMode == string(condition.DNSResolverWire) && serverAddr == "" {
+		return opts, "", fmt.Errorf("--resolver wire requires --server")
+	}
+	return opts, serverAddr, nil
+}
+
+func validDNSRecordType(recordType condition.DNSRecordType) bool {
+	return dnsCLIRecordTypes[recordType]
+}
+
+var dnsCLIRecordTypes = map[condition.DNSRecordType]bool{
+	condition.DNSRecordA:     true,
+	condition.DNSRecordAAAA:  true,
+	condition.DNSRecordCNAME: true,
+	condition.DNSRecordTXT:   true,
+	condition.DNSRecordANY:   true,
+	condition.DNSRecordMX:    true,
+	condition.DNSRecordSRV:   true,
+	condition.DNSRecordNS:    true,
+	condition.DNSRecordCAA:   true,
+	condition.DNSRecordHTTPS: true,
+	condition.DNSRecordSVCB:  true,
+}
+
+func validateDNSResolverMode(resolverMode string, recordType condition.DNSRecordType) error {
+	if resolverMode != string(condition.DNSResolverSystem) && resolverMode != string(condition.DNSResolverWire) {
+		return fmt.Errorf("invalid dns resolver %q", resolverMode)
+	}
+	if resolverMode == string(condition.DNSResolverSystem) && !systemDNSRecordType(recordType) {
+		return fmt.Errorf("dns record type %s requires --resolver wire", recordType)
+	}
+	return nil
+}
+
+func validateDNSMatchers(opts dnsParseOptions) error {
+	if opts.minCount < 0 {
+		return fmt.Errorf("min-count cannot be negative")
+	}
+	if opts.absent && (opts.contains != "" || len(opts.equals) > 0 || opts.minCount > 0) {
+		return fmt.Errorf("--absent cannot be combined with --contains, --equals, or --min-count")
+	}
+	return nil
+}
+
+func validateDNSWireOptions(opts dnsParseOptions) error {
+	if err := validateDNSAbsentOptions(opts); err != nil {
+		return err
+	}
+	if err := validateDNSTransportOptions(opts); err != nil {
+		return err
+	}
+	if opts.udpSize < 0 || opts.udpSize > 65535 {
+		return fmt.Errorf("udp-size must be between 0 and 65535")
+	}
+	return nil
+}
+
+func validateDNSAbsentOptions(opts dnsParseOptions) error {
+	if opts.absentMode != "any" && opts.absentMode != "nxdomain" && opts.absentMode != "nodata" {
+		return fmt.Errorf("invalid dns absent-mode %q", opts.absentMode)
+	}
+	if opts.absentMode != "any" && opts.resolverMode != string(condition.DNSResolverWire) {
+		return fmt.Errorf("--absent-mode requires --resolver wire")
+	}
+	return nil
+}
+
+func validateDNSTransportOptions(opts dnsParseOptions) error {
+	if opts.transport != "udp" && opts.transport != "tcp" {
+		return fmt.Errorf("invalid dns transport %q", opts.transport)
+	}
+	if usesWireOnlyOptions(opts) && opts.resolverMode != string(condition.DNSResolverWire) {
+		return fmt.Errorf("--rcode, --transport, --edns0, and --udp-size require --resolver wire")
+	}
+	return nil
+}
+
+func usesWireOnlyOptions(opts dnsParseOptions) bool {
+	return opts.rcode != "" || opts.transport == "tcp" || opts.edns0 || opts.udpSize > 0
+}
+
+func systemDNSRecordType(recordType condition.DNSRecordType) bool {
+	switch recordType {
+	case condition.DNSRecordA, condition.DNSRecordAAAA, condition.DNSRecordCNAME, condition.DNSRecordTXT, condition.DNSRecordANY:
+		return true
+	default:
+		return false
+	}
+}
+
+func parseDNSServer(server string) (string, error) {
+	if server == "" {
+		return "", nil
+	}
+	if host, port, err := net.SplitHostPort(server); err == nil {
+		return validateDNSServerHostPort(server, host, port)
+	}
+	if strings.HasPrefix(server, "[") && strings.HasSuffix(server, "]") {
+		return net.JoinHostPort(strings.Trim(server, "[]"), "53"), nil
+	}
+	if isBareIPv6Address(server) {
+		return net.JoinHostPort(server, "53"), nil
+	}
+	if strings.Contains(server, ":") {
+		return "", fmt.Errorf("invalid dns server address %q", server)
+	}
+	return net.JoinHostPort(server, "53"), nil
+}
+
+func validateDNSServerHostPort(server, host, port string) (string, error) {
+	if host == "" || port == "" {
+		return "", fmt.Errorf("invalid dns server address %q", server)
+	}
+	return server, nil
+}
+
+func isBareIPv6Address(server string) bool {
+	return strings.Contains(server, ":") && strings.Count(server, ":") > 1
+}
+
+func parseDockerCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("docker", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	status := "running"
+	health := ""
+	fs.StringVar(&status, "status", status, "container status: any|created|running|paused|restarting|removing|exited|dead")
+	fs.StringVar(&health, "health", health, "container health: healthy|unhealthy|starting|none")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	args := fs.Args()
+	if len(args) != 1 {
+		return nil, fmt.Errorf("docker requires exactly one CONTAINER")
+	}
+	status = strings.ToLower(status)
+	if !validDockerStatus(status) {
+		return nil, fmt.Errorf("invalid docker status %q", status)
+	}
+	health = strings.ToLower(health)
+	if !validDockerHealth(health) {
+		return nil, fmt.Errorf("invalid docker health %q", health)
+	}
+	cond := condition.NewDocker(args[0])
+	cond.Status = status
+	cond.Health = health
+	return cond, nil
+}
+
+func validDockerStatus(status string) bool {
+	switch status {
+	case "any", "created", "running", "paused", "restarting", "removing", "exited", "dead":
+		return true
+	default:
+		return false
+	}
+}
+
+func validDockerHealth(health string) bool {
+	switch health {
+	case "", "healthy", "unhealthy", "starting", "none":
+		return true
+	default:
+		return false
+	}
 }
 
 func parseFileCondition(segment []string) (condition.Condition, error) {
@@ -564,7 +818,7 @@ func splitConditionSegments(args []string) ([][]string, error) {
 
 func isBackend(arg string) bool {
 	switch arg {
-	case "http", "tcp", "exec", "file", "k8s":
+	case "http", "tcp", "exec", "file", "k8s", "dns", "docker":
 		return true
 	default:
 		return false
@@ -686,6 +940,28 @@ HTTP:
 TCP:
   waitfor tcp HOST:PORT
 
+DNS:
+  waitfor dns [flags] HOST
+  --type A|AAAA|CNAME|TXT|ANY|MX|SRV|NS|CAA|HTTPS|SVCB
+                           DNS record type (default: A; MX/SRV/NS/CAA/HTTPS/SVCB require --resolver wire)
+  --resolver system|wire   Resolver mode (default: system)
+  --contains text          Required record substring
+  --equals value           Required exact record value (repeatable)
+  --min-count N            Minimum answer count
+  --absent                 Wait until the record is absent
+  --absent-mode any|nxdomain|nodata
+                           Wire absence mode (default: any)
+  --server address         DNS server address; port defaults to 53
+  --rcode code             Wire response code, such as NOERROR or NXDOMAIN
+  --transport udp|tcp      Wire transport (default: udp; truncated UDP retries over TCP)
+  --edns0                  Enable EDNS0 for wire resolver
+  --udp-size N             Wire EDNS0 UDP payload size
+
+Docker:
+  waitfor docker [flags] CONTAINER
+  --status running         Container status: any|created|running|paused|restarting|removing|exited|dead
+  --health healthy         Container health: healthy|unhealthy|starting|none
+
 Exec:
   waitfor exec [flags] -- COMMAND [ARGS...]
   --exit-code 0            Expected exit code (default: 0)
@@ -710,6 +986,8 @@ Kubernetes:
 Examples:
   waitfor http https://api.example.com/health --status 200
   waitfor tcp localhost:5432
+  waitfor dns api.internal --type A
+  waitfor docker postgres --health healthy
   waitfor file /tmp/ready.flag exists
   waitfor exec --output-contains Running -- kubectl get pod myapp
   waitfor k8s deployment/api --condition Available

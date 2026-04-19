@@ -56,6 +56,8 @@ Backends:
 ```text
 http URL [--status 200|2xx] [--method GET] [--body text] [--body-file path] [--body-contains text] [--body-matches regex] [--jsonpath expr] [--header K=V] [--no-follow-redirects]
 tcp HOST:PORT
+dns HOST [--resolver system|wire] [--type A|AAAA|CNAME|TXT|ANY|MX|SRV|NS|CAA|HTTPS|SVCB] [--contains text] [--equals value] [--min-count N] [--absent] [--absent-mode any|nxdomain|nodata] [--server address] [--rcode code] [--transport udp|tcp] [--edns0] [--udp-size N]
+docker CONTAINER [--status running] [--health healthy]
 exec [--exit-code 0] [--output-contains text] [--jsonpath expr] [--cwd path] [--env K=V] [--max-output-bytes N] -- COMMAND [ARGS...]
 file PATH [exists|deleted|nonempty] [--contains text]
 k8s RESOURCE [--condition Ready] [--namespace default] [--jsonpath expr] [--kubeconfig path]

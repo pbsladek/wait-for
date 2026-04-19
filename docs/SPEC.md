@@ -22,6 +22,8 @@ Runs have one final status:
 | `tcp` | `waitfor tcp HOST:PORT` | Opens and closes a TCP connection. |
 | `exec` | `waitfor exec --output-contains ok -- COMMAND` | Runs a command with context cancellation and checks exit code, output substring, or JSON expression. Supports cwd, env, and output limits. |
 | `file` | `waitfor file PATH exists` | Supports `exists`, `deleted`, `nonempty`, and substring checks. |
+| `dns` | `waitfor dns api.internal --type A` | Uses the system resolver by default or `--resolver wire` for protocol-level checks via `codeberg.org/miekg/dns`; supports exact values, minimum answer counts, absence, selected RCODEs, and richer RR types. |
+| `docker` | `waitfor docker postgres --health healthy` | Uses `docker inspect` for local container status and health checks. |
 | `k8s` | `waitfor k8s deployment/myapp --condition Available` | Uses client-go dynamic client and supports common built-in Kubernetes resources. |
 
 ## CLI Grammar
@@ -38,7 +40,7 @@ exec-condition := exec [exec-flags] -- command [args...]
 ```
 
 Because `-- backend` is the condition separator, an exec command that needs the
-literal token pair `-- file`, `-- http`, `-- tcp`, `-- exec`, or `-- k8s` cannot
+literal token pair `-- file`, `-- http`, `-- tcp`, `-- dns`, `-- docker`, `-- exec`, or `-- k8s` cannot
 be followed unambiguously by more waitfor conditions.
 
 ## Core Contract

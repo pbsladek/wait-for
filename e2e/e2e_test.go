@@ -630,7 +630,7 @@ func TestHelpText(t *testing.T) {
 	if code != cli.ExitSatisfied {
 		t.Fatalf("--help exit code = %d, want 0", code)
 	}
-	for _, want := range []string{"waitfor", "http", "tcp", "exec", "file", "k8s", "Exit codes"} {
+	for _, want := range []string{"waitfor", "http", "tcp", "dns", "docker", "exec", "file", "k8s", "Exit codes"} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("help text missing %q", want)
 		}
@@ -713,6 +713,40 @@ func TestInvalidHTTPURL(t *testing.T) {
 	}
 	if stderr == "" {
 		t.Fatal("expected error on stderr")
+	}
+}
+
+func TestDNSLocalhost(t *testing.T) {
+	mustCode(t, cli.ExitSatisfied, "dns", "localhost", "--type", "ANY", "--equals", "127.0.0.1", "--min-count", "1")
+}
+
+func TestDNSInvalidType(t *testing.T) {
+	code, _, stderr := execute(t, "dns", "localhost", "--type", "BOGUS")
+	if code != cli.ExitInvalid {
+		t.Fatalf("exit code = %d, want %d", code, cli.ExitInvalid)
+	}
+	if !strings.Contains(stderr, "invalid dns record type") {
+		t.Fatalf("stderr %q does not mention invalid dns record type", stderr)
+	}
+}
+
+func TestDNSAbsentMatcherConflict(t *testing.T) {
+	code, _, stderr := execute(t, "dns", "localhost", "--absent", "--contains", "127.0.0.1")
+	if code != cli.ExitInvalid {
+		t.Fatalf("exit code = %d, want %d", code, cli.ExitInvalid)
+	}
+	if !strings.Contains(stderr, "--absent cannot be combined") {
+		t.Fatalf("stderr %q does not mention absent conflict", stderr)
+	}
+}
+
+func TestDockerInvalidStatus(t *testing.T) {
+	code, _, stderr := execute(t, "docker", "api", "--status", "warm")
+	if code != cli.ExitInvalid {
+		t.Fatalf("exit code = %d, want %d", code, cli.ExitInvalid)
+	}
+	if !strings.Contains(stderr, "invalid docker status") {
+		t.Fatalf("stderr %q does not mention invalid docker status", stderr)
 	}
 }
 

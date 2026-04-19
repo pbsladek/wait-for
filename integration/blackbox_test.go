@@ -258,6 +258,13 @@ func TestBinaryTCPPolling(t *testing.T) {
 	}
 }
 
+func TestBinaryDNSLocalhost(t *testing.T) {
+	requireBlackbox(t)
+
+	result := runWaitfor(t, "dns", "localhost", "--type", "ANY", "--equals", "127.0.0.1", "--min-count", "1")
+	requireExitCode(t, result, 0)
+}
+
 func freeTCPAddress(t *testing.T) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

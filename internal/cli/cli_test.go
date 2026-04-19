@@ -486,6 +486,133 @@ func TestParseTCPConditionNoArgs(t *testing.T) {
 	}
 }
 
+// ── parseDNSCondition ─────────────────────────────────────────────────────────
+
+func TestParseDNSConditionSuccess(t *testing.T) {
+	tests := [][]string{
+		{"dns", "example.com"},
+		{"dns", "example.com", "--type", "AAAA"},
+		{"dns", "example.com", "--type", "txt", "--contains", "ready"},
+		{"dns", "example.com", "--equals", "192.0.2.10", "--min-count", "1"},
+		{"dns", "example.com", "--absent"},
+		{"dns", "example.com", "--server", "1.1.1.1"},
+		{"dns", "example.com", "--resolver", "wire", "--server", "1.1.1.1", "--type", "MX", "--rcode", "NOERROR"},
+		{"dns", "example.com", "--resolver", "wire", "--server", "1.1.1.1", "--absent", "--absent-mode", "nxdomain"},
+		{"dns", "example.com", "--resolver", "wire", "--server", "1.1.1.1", "--transport", "tcp", "--edns0", "--udp-size", "1232"},
+	}
+	for _, segment := range tests {
+		cond, err := parseDNSCondition(segment)
+		if err != nil {
+			t.Fatalf("parseDNSCondition(%v) error = %v", segment, err)
+		}
+		if cond == nil {
+			t.Fatalf("parseDNSCondition(%v) returned nil", segment)
+		}
+	}
+}
+
+func TestParseDNSConditionErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		segment []string
+		wantErr string
+	}{
+		{"missing host", []string{"dns"}, "exactly one HOST"},
+		{"too many args", []string{"dns", "example.com", "extra"}, "exactly one HOST"},
+		{"bad type", []string{"dns", "example.com", "--type", "BOGUS"}, "invalid dns record type"},
+		{"mx requires wire", []string{"dns", "example.com", "--type", "MX"}, "requires --resolver wire"},
+		{"bad resolver", []string{"dns", "example.com", "--resolver", "raw"}, "invalid dns resolver"},
+		{"bad min count", []string{"dns", "example.com", "--min-count", "-1"}, "min-count cannot be negative"},
+		{"absent conflict", []string{"dns", "example.com", "--absent", "--contains", "ready"}, "--absent cannot be combined"},
+		{"bad absent mode", []string{"dns", "example.com", "--absent-mode", "gone"}, "invalid dns absent-mode"},
+		{"wire-only absent mode", []string{"dns", "example.com", "--absent-mode", "nxdomain"}, "--absent-mode requires"},
+		{"bad transport", []string{"dns", "example.com", "--resolver", "wire", "--server", "1.1.1.1", "--transport", "quic"}, "invalid dns transport"},
+		{"wire-only rcode", []string{"dns", "example.com", "--rcode", "NOERROR"}, "require --resolver wire"},
+		{"bad udp size", []string{"dns", "example.com", "--resolver", "wire", "--server", "1.1.1.1", "--udp-size", "70000"}, "udp-size"},
+		{"wire missing server", []string{"dns", "example.com", "--resolver", "wire"}, "--resolver wire requires --server"},
+		{"bad server", []string{"dns", "example.com", "--server", "host:"}, "invalid dns server address"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseDNSCondition(tt.segment)
+			if err == nil {
+				t.Fatal("parseDNSCondition() expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("err = %q, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestParseDNSServer(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"", ""},
+		{"1.1.1.1", "1.1.1.1:53"},
+		{"1.1.1.1:5353", "1.1.1.1:5353"},
+		{"::1", "[::1]:53"},
+		{"[::1]", "[::1]:53"},
+		{"[::1]:5353", "[::1]:5353"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, err := parseDNSServer(tt.input)
+			if err != nil {
+				t.Fatalf("parseDNSServer(%q) error = %v", tt.input, err)
+			}
+			if got != tt.want {
+				t.Fatalf("parseDNSServer(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// ── parseDockerCondition ──────────────────────────────────────────────────────
+
+func TestParseDockerConditionSuccess(t *testing.T) {
+	tests := [][]string{
+		{"docker", "api"},
+		{"docker", "api", "--status", "any"},
+		{"docker", "api", "--status", "running", "--health", "healthy"},
+	}
+	for _, segment := range tests {
+		cond, err := parseDockerCondition(segment)
+		if err != nil {
+			t.Fatalf("parseDockerCondition(%v) error = %v", segment, err)
+		}
+		if cond == nil {
+			t.Fatalf("parseDockerCondition(%v) returned nil", segment)
+		}
+	}
+}
+
+func TestParseDockerConditionErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		segment []string
+		wantErr string
+	}{
+		{"missing container", []string{"docker"}, "exactly one CONTAINER"},
+		{"too many args", []string{"docker", "api", "extra"}, "exactly one CONTAINER"},
+		{"bad status", []string{"docker", "api", "--status", "warm"}, "invalid docker status"},
+		{"bad health", []string{"docker", "api", "--health", "warm"}, "invalid docker health"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseDockerCondition(tt.segment)
+			if err == nil {
+				t.Fatal("parseDockerCondition() expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("err = %q, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 // ── splitConditionSegments ────────────────────────────────────────────────────
 
 func TestSplitConditionSegmentsLeadingDash(t *testing.T) {
