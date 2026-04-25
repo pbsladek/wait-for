@@ -30,12 +30,15 @@ Runs have one final status:
 ## CLI Grammar
 
 Global flags must appear before the first backend name. Multiple conditions are
-chained with `--` followed by a backend name. At least one condition is required.
+chained with `--` followed by a backend name. At least one non-guard condition
+is required. Prefix a condition segment with `guard` to make it a fail-fast
+guard instead of a readiness requirement.
 
 ```text
 waitfor [global-flags] condition [-- condition ...]
 
 condition     := backend [backend-flags] target
+guard         := guard condition
 exec-condition := exec [exec-flags] -- command [args ...]
 ```
 
@@ -63,6 +66,8 @@ waitfor log /var/log/app.log --contains -- -- http https://api.example.com
 | `--timeout duration` | `5m` | Global deadline for the run. |
 | `--interval duration` | `2s` | Delay between poll attempts. |
 | `--attempt-timeout duration` | `0` (disabled) | Per-attempt deadline; `0` means each attempt receives the remaining global time. |
+| `--successes N` | `1` | Consecutive successful checks required before a non-guard condition is complete. |
+| `--stable-for duration` | `0` (disabled) | Required continuous success duration before a non-guard condition is complete. |
 | `--output text\|json` | `text` | Output format. JSON is written to stdout; text progress goes to stderr. |
 | `--mode all\|any` | `all` | `all` requires every condition to satisfy; `any` stops after the first. |
 | `--verbose` | `false` | Emit a line per attempt in text mode. |
@@ -125,9 +130,12 @@ log PATH
     [--tail N]                      # scan last N lines of existing content before tailing
     [--min-matches N]               # cumulative matching lines required (default: 1)
 
-k8s RESOURCE                        # kind/name, e.g. deployment/myapp or job/migrate
+k8s RESOURCE                        # kind/name, or kind when --selector is used
     [--condition TYPE]              # checks .status.conditions[] for type with status=True
-    [--jsonpath EXPR]               # mutually exclusive with --condition
+    [--for ready|rollout|complete]  # typed waits for pods, workloads, and jobs
+    [--selector LABELS]             # list kind-level resources by label selector
+    [--all]                         # with --selector, require every selected resource
+    [--jsonpath EXPR]               # mutually exclusive with --condition and --for
     [--namespace NAMESPACE]         # default: default
     [--kubeconfig PATH]
 ```
@@ -294,9 +302,10 @@ may not have written its log yet).
 
 ### Kubernetes
 
-Resources use `kind/name` syntax. Supported kinds: `pod`, `service`,
-`deployment`, `replicaset`, `statefulset`, `daemonset`, `job`, `namespace`.
-All are namespaced except `namespace`. The default namespace is `default`.
+Resources use `kind/name` syntax, or plain `kind` syntax with `--selector`.
+Supported kinds: `pod`, `service`, `deployment`, `replicaset`, `statefulset`,
+`daemonset`, `job`, `namespace`. All are namespaced except `namespace`. The
+default namespace is `default`.
 
 Uses the client-go dynamic client in production; a `KubernetesGetter`
 interface in tests. API lookup errors and missing resources are retryable.
@@ -305,8 +314,20 @@ directly and argument errors through the CLI.
 
 `--condition TYPE` checks `.status.conditions[]` for a condition whose `type`
 matches and whose `status` is `"True"`. `--jsonpath EXPR` evaluates the
-minimal expression language against the full unstructured object. `--condition`
-and `--jsonpath` are mutually exclusive.
+minimal expression language against the full unstructured object. `--for`
+enables typed waits:
+
+| `--for` value | Supported resources | Satisfied when |
+| ------------- | ------------------- | -------------- |
+| `ready` | `pod` | Ready condition is `True`; phase `Failed` is fatal. |
+| `rollout` | `deployment`, `statefulset`, `daemonset` | Observed generation has caught up and updated/ready or available counts meet desired counts. |
+| `complete` | `job` | Complete condition is `True`; Failed condition is fatal. |
+
+`--selector LABELS` lists resources by kind and applies the typed wait to the
+matched objects. With `--all`, every selected object must satisfy the typed
+wait; without it, the first satisfied object completes the condition. An empty
+selector result is retryable. `--condition`, `--jsonpath`, and `--for` are
+mutually exclusive.
 
 ## Core Contract
 
@@ -341,6 +362,8 @@ type Config struct {
     Timeout           time.Duration
     Interval          time.Duration
     PerAttemptTimeout time.Duration
+    RequiredSuccesses int
+    StableFor         time.Duration
     Mode              Mode          // ModeAll | ModeAny
     OnAttempt         func(AttemptEvent)
 }
@@ -352,6 +375,16 @@ the first satisfaction. Fatal errors take precedence over satisfaction when
 both are recorded in the same run. A per-attempt timeout of `0` passes the
 global run context directly to each check. If `PerAttemptTimeout` exceeds the
 global `Timeout`, it is normalised to the global timeout before the run starts.
+
+`RequiredSuccesses` and `StableFor` apply only to non-guard conditions. A
+successful backend check is treated as still pending until the configured
+consecutive success count and continuous stable duration are both met. Any
+unsatisfied check resets the stability streak.
+
+Guard conditions are polled concurrently but are ignored for satisfaction. If a
+guard condition becomes satisfied, it is converted to a fatal result and the
+run stops immediately. Once all non-guard conditions have completed in
+`ModeAll`, the runner cancels remaining guards and returns satisfied.
 
 ## Output
 
@@ -370,6 +403,8 @@ JSON schema (stable):
   "timeout_seconds": 300.0,
   "interval_seconds": 2.0,
   "per_attempt_timeout_seconds": 5.0,
+  "required_successes": 3,
+  "stable_for_seconds": 10.0,
   "conditions": [
     {
       "backend": "log",
@@ -380,13 +415,17 @@ JSON schema (stable):
       "elapsed_seconds": 1.0,
       "detail": "matched: service ready at port 8080",
       "last_error": "",
-      "fatal": false
+      "fatal": false,
+      "guard": false
     }
   ]
 }
 ```
 
 `per_attempt_timeout_seconds` is omitted when the per-attempt timeout is zero.
+`required_successes` is omitted when it is `1`; `stable_for_seconds` is omitted
+when the stable duration is zero. `guard` is omitted or false for normal
+readiness conditions.
 `last_error` is omitted or empty when no error was recorded. Text summaries on
 failure list each unsatisfied condition with its last error when available,
 otherwise its last detail.

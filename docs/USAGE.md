@@ -526,6 +526,51 @@ and retried after the interval. The global 5-minute deadline still applies.
 
 ---
 
+## 26. Fail fast when a guard condition appears
+
+Wait for an API, but stop immediately if startup logs show a fatal error:
+
+```bash
+waitfor --timeout 5m \
+  http https://api.example.com/health \
+  -- guard log /var/log/app.log --matches "FATAL|panic"
+```
+
+The HTTP condition is the readiness requirement. The log condition is a guard:
+if it matches, `waitfor` exits `3` instead of waiting for the full timeout.
+
+---
+
+## 27. Require stable readiness before continuing
+
+Avoid starting the next step on a one-off successful probe:
+
+```bash
+waitfor --successes 3 --stable-for 15s \
+  http https://api.example.com/health --status 200
+```
+
+The service must return the expected response on consecutive checks and remain
+successful for the stable duration before the run exits `0`.
+
+---
+
+## 28. Wait for Kubernetes rollouts and selected pods
+
+Use typed waits instead of writing JSON expressions for common Kubernetes
+states:
+
+```bash
+waitfor k8s deployment/api --for rollout --namespace production
+waitfor k8s pod --selector app=api --for ready --all --namespace production
+waitfor k8s job/migrate --for complete --namespace production
+```
+
+`--for complete` treats a failed job as fatal. `--selector` switches the
+resource argument from `kind/name` to plain `kind`.
+
+---
+
 ## Tips
 
 **Exit code check in `set -e` scripts.** `waitfor` exits non-zero on timeout or
