@@ -13,6 +13,7 @@ permissions:
 
 env:
   IMAGE_NAME: pwbsladek/waitfor
+  PLATFORMS: linux/amd64,linux/arm64
   GO_IMAGE: dhi.io/golang:1.26-dev
   RUNTIME_IMAGE: dhi.io/static:20250419
 
@@ -20,9 +21,19 @@ jobs:
   image-test:
     name: Build and smoke test image
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            suffix: amd64
+          - platform: linux/arm64
+            suffix: arm64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -39,7 +50,8 @@ jobs:
         with:
           context: .
           load: true
-          tags: waitfor:test
+          platforms: ${{ matrix.platform }}
+          tags: waitfor:test-${{ matrix.suffix }}
           build-args: |
             GO_IMAGE=${{ env.GO_IMAGE }}
             RUNTIME_IMAGE=${{ env.RUNTIME_IMAGE }}
@@ -47,7 +59,7 @@ jobs:
             COMMIT=${{ github.sha }}
 
       - name: Smoke test
-        run: docker run --rm waitfor:test --help
+        run: docker run --rm --platform ${{ matrix.platform }} waitfor:test-${{ matrix.suffix }} --help
 
   publish:
     name: Publish image
@@ -90,7 +102,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ env.PLATFORMS }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

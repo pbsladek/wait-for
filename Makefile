@@ -2,11 +2,12 @@ BINARY := waitfor
 PKG := ./cmd/waitfor
 DOCKER_IMAGE ?= pwbsladek/waitfor
 DOCKER_TAG ?= local
+DOCKER_PLATFORMS ?= linux/amd64,linux/arm64
 DHI_GO_IMAGE ?= dhi.io/golang:1.26-dev
 DHI_RUNTIME_IMAGE ?= dhi.io/static:20250419
 VERSION ?=
 
-.PHONY: build build-linux build-arm docker-build docker-push docker-run test test-e2e test-integration test-integration-docker test-integration-k8s lint security coverage bench tag push-tag release-tag release clean
+.PHONY: build build-linux build-arm build-darwin build-windows build-all docker-build docker-push docker-run test test-e2e test-integration test-integration-docker test-integration-k8s lint security coverage bench tag push-tag release-tag release clean
 
 build:
 	go build -o bin/$(BINARY) $(PKG)
@@ -17,11 +18,21 @@ build-linux:
 build-arm:
 	GOOS=linux GOARCH=arm64 go build -o bin/$(BINARY)-linux-arm64 $(PKG)
 
+build-darwin:
+	GOOS=darwin GOARCH=amd64 go build -o bin/$(BINARY)-darwin-amd64 $(PKG)
+	GOOS=darwin GOARCH=arm64 go build -o bin/$(BINARY)-darwin-arm64 $(PKG)
+
+build-windows:
+	GOOS=windows GOARCH=amd64 go build -o bin/$(BINARY)-windows-amd64.exe $(PKG)
+	GOOS=windows GOARCH=arm64 go build -o bin/$(BINARY)-windows-arm64.exe $(PKG)
+
+build-all: build-linux build-arm build-darwin build-windows
+
 docker-build:
 	docker buildx build --load --build-arg GO_IMAGE=$(DHI_GO_IMAGE) --build-arg RUNTIME_IMAGE=$(DHI_RUNTIME_IMAGE) -t $(DOCKER_IMAGE):$(DOCKER_TAG) .
 
 docker-push:
-	docker buildx build --platform linux/amd64,linux/arm64 --push --build-arg GO_IMAGE=$(DHI_GO_IMAGE) --build-arg RUNTIME_IMAGE=$(DHI_RUNTIME_IMAGE) -t $(DOCKER_IMAGE):$(DOCKER_TAG) .
+	docker buildx build --platform $(DOCKER_PLATFORMS) --push --build-arg GO_IMAGE=$(DHI_GO_IMAGE) --build-arg RUNTIME_IMAGE=$(DHI_RUNTIME_IMAGE) -t $(DOCKER_IMAGE):$(DOCKER_TAG) .
 
 docker-run:
 	docker run --rm $(DOCKER_IMAGE):$(DOCKER_TAG) $(ARGS)
