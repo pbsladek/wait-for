@@ -180,12 +180,22 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
+            ext: ''
           - goos: linux
             goarch: arm64
+            ext: ''
           - goos: darwin
             goarch: amd64
+            ext: ''
           - goos: darwin
             goarch: arm64
+            ext: ''
+          - goos: windows
+            goarch: amd64
+            ext: '.exe'
+          - goos: windows
+            goarch: arm64
+            ext: '.exe'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -197,7 +207,7 @@ jobs:
           cache: true
 
       - name: Build binary
-        run: go build -trimpath -o "dist/waitfor-${{ matrix.goos }}-${{ matrix.goarch }}" ./cmd/waitfor
+        run: go build -trimpath -o "dist/waitfor-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}" ./cmd/waitfor
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
@@ -207,4 +217,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: waitfor-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/waitfor-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/waitfor-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}

@@ -1,19 +1,16 @@
+//go:build !windows
+
 package main
 
 import (
 	"os"
 	"os/exec"
-	"runtime"
 	"syscall"
 	"testing"
 	"time"
 )
 
 func TestMainSignalCancellation(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("signal behavior differs on windows")
-	}
-
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
