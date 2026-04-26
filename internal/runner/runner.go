@@ -2,8 +2,9 @@ package runner
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"errors"
-	"math/rand"
+	"math/big"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -370,7 +371,6 @@ type pollSchedule struct {
 	backoff Backoff
 	jitter  float64
 	current time.Duration
-	rng     *rand.Rand
 }
 
 func newPollSchedule(cfg Config) *pollSchedule {
@@ -380,7 +380,6 @@ func newPollSchedule(cfg Config) *pollSchedule {
 		backoff: cfg.Backoff,
 		jitter:  cfg.Jitter,
 		current: cfg.Interval,
-		rng:     rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
@@ -407,9 +406,17 @@ func (s *pollSchedule) withJitter(interval time.Duration) time.Duration {
 	if s.jitter == 0 {
 		return interval
 	}
-	factor := 1 - s.jitter + s.rng.Float64()*2*s.jitter
+	factor := 1 - s.jitter + randomUnitFloat()*2*s.jitter
 	jittered := time.Duration(float64(interval) * factor)
 	return maxDuration(jittered, time.Nanosecond)
+}
+
+func randomUnitFloat() float64 {
+	n, err := cryptorand.Int(cryptorand.Reader, big.NewInt(1_000_000))
+	if err != nil {
+		return 0.5
+	}
+	return float64(n.Int64()) / 1_000_000
 }
 
 func minDuration(a, b time.Duration) time.Duration {
