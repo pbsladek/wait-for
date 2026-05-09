@@ -76,7 +76,7 @@ func newCommand(stdin io.Reader, stdout io.Writer, stderr io.Writer) *cobra.Comm
 		SilenceErrors:      true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if isDoctorCommand(args) {
-				code, err := runDoctor(args[1:], stdout, stderr)
+				code, err := runDoctor(cmd.Context(), args[1:], stdout, stderr)
 				if err != nil {
 					return exitError{code: code, err: err}
 				}
@@ -705,7 +705,7 @@ func normalizeDNSOptions(opts dnsParseOptions) (dnsParseOptions, string, error) 
 	if err := validateDNSWireOptions(opts); err != nil {
 		return opts, "", err
 	}
-	serverAddr, err := parseDNSServer(opts.server)
+	serverAddr, err := condition.NormalizeDNSServer(opts.server)
 	if err != nil {
 		return opts, "", err
 	}
@@ -800,89 +800,6 @@ func systemDNSRecordType(recordType condition.DNSRecordType) bool {
 	default:
 		return false
 	}
-}
-
-func parseDNSServer(server string) (string, error) {
-	if server == "" {
-		return "", nil
-	}
-	if err := validateRawDNSServer(server); err != nil {
-		return "", err
-	}
-	if host, port, err := net.SplitHostPort(server); err == nil {
-		return validateDNSServerHostPort(server, host, port)
-	}
-	return parseDNSServerWithoutPort(server)
-}
-
-func validateRawDNSServer(server string) error {
-	if strings.TrimSpace(server) != server {
-		return fmt.Errorf("invalid dns server address %q", server)
-	}
-	return nil
-}
-
-func parseDNSServerWithoutPort(server string) (string, error) {
-	if strings.HasPrefix(server, "[") && strings.HasSuffix(server, "]") {
-		host := strings.TrimSuffix(strings.TrimPrefix(server, "["), "]")
-		return defaultDNSServerPort(server, host)
-	}
-	if isBareIPv6Address(server) {
-		return defaultDNSServerPort(server, server)
-	}
-	if strings.Contains(server, ":") {
-		return "", fmt.Errorf("invalid dns server address %q", server)
-	}
-	return defaultDNSServerPort(server, server)
-}
-
-func defaultDNSServerPort(server, host string) (string, error) {
-	if err := validateDNSServerHost(server, host); err != nil {
-		return "", err
-	}
-	return net.JoinHostPort(host, "53"), nil
-}
-
-func validateDNSServerHostPort(server, host, port string) (string, error) {
-	if err := validateDNSServerHost(server, host); err != nil {
-		return "", err
-	}
-	if port == "" {
-		return "", fmt.Errorf("invalid dns server address %q", server)
-	}
-	if err := validateDNSPort(port); err != nil {
-		return "", fmt.Errorf("invalid dns server address %q: %w", server, err)
-	}
-	return server, nil
-}
-
-func validateDNSServerHost(server, host string) error {
-	if host == "" || containsSpaceOrControl(host) {
-		return fmt.Errorf("invalid dns server address %q", server)
-	}
-	return nil
-}
-
-func containsSpaceOrControl(s string) bool {
-	for i := 0; i < len(s); i++ {
-		ch := s[i]
-		if ch <= 0x20 || ch == 0x7f {
-			return true
-		}
-	}
-	return false
-}
-
-func validateDNSPort(port string) error {
-	n, err := strconv.Atoi(port)
-	if err != nil || n < 1 || n > 65535 {
-		return fmt.Errorf("port must be between 1 and 65535")
-	}
-	return nil
-}
-
-func isBareIPv6Address(server string) bool {
-	return strings.Contains(server, ":") && strings.Count(server, ":") > 1
 }
 
 func parseDockerCondition(segment []string) (condition.Condition, error) {
@@ -1325,6 +1242,8 @@ var conditionValueFlags = map[string]bool{
 	"--contains":         true,
 	"--matches":          true,
 	"--exclude":          true,
+	"--tail":             true,
+	"--min-matches":      true,
 	"--equals":           true,
 	"--min-count":        true,
 	"--absent-mode":      true,

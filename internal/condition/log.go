@@ -47,11 +47,11 @@ type logChunk struct {
 }
 
 func NewLog(path string) *LogCondition {
-	return &LogCondition{Path: path}
+	return &LogCondition{Path: path, MinMatches: 1}
 }
 
 func (c *LogCondition) Descriptor() Descriptor {
-	return Descriptor{Backend: "log", Target: c.Path, Name: fmt.Sprintf("log %s", c.Path)}
+	return Descriptor{Backend: "log", Target: c.Path}
 }
 
 func (c *LogCondition) Check(ctx context.Context) Result {
@@ -59,6 +59,10 @@ func (c *LogCondition) Check(ctx context.Context) Result {
 	case <-ctx.Done():
 		return Unsatisfied("", ctx.Err())
 	default:
+	}
+
+	if err := validateLogConfig(c); err != nil {
+		return Fatal(err)
 	}
 
 	info, err := os.Stat(c.Path)
@@ -82,6 +86,25 @@ func (c *LogCondition) Check(ctx context.Context) Result {
 		c.offset = chunk.nextOffset
 	}
 	return result
+}
+
+func validateLogConfig(c *LogCondition) error {
+	if c.Path == "" {
+		return fmt.Errorf("log path is required")
+	}
+	if c.Contains == "" && c.Regex == nil && c.JSONExpr == nil {
+		return fmt.Errorf("log requires at least one matcher")
+	}
+	if c.FromStart && c.Tail > 0 {
+		return fmt.Errorf("log from-start and tail are mutually exclusive")
+	}
+	if c.Tail < 0 {
+		return fmt.Errorf("log tail cannot be negative")
+	}
+	if c.MinMatches < 1 {
+		return fmt.Errorf("log min-matches must be at least 1")
+	}
+	return nil
 }
 
 func (c *LogCondition) readNewContent(info os.FileInfo) (logChunk, error) {
@@ -169,10 +192,7 @@ func (c *LogCondition) scanLines(ctx context.Context, data []byte) (Result, bool
 }
 
 func (c *LogCondition) requiredMatches() int {
-	if c.MinMatches > 0 {
-		return c.MinMatches
-	}
-	return 1
+	return c.MinMatches
 }
 
 func (c *LogCondition) satisfiedDetail(line []byte) string {

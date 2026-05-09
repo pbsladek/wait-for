@@ -2,6 +2,7 @@ package condition
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -50,6 +51,20 @@ func TestExecConditionNegativeExpectedExitCodeFatal(t *testing.T) {
 	result := cond.Check(t.Context())
 	if result.Status != CheckFatal {
 		t.Fatalf("status = %s, want fatal", result.Status)
+	}
+}
+
+func TestExecConditionInvalidOutputLimitFatal(t *testing.T) {
+	for _, limit := range []int64{0, -1} {
+		t.Run(fmt.Sprintf("limit %d", limit), func(t *testing.T) {
+			cond := NewExec([]string{"/bin/sh", "-c", "printf ok"})
+			cond.MaxOutputBytes = limit
+
+			result := cond.Check(t.Context())
+			if result.Status != CheckFatal {
+				t.Fatalf("status = %s, want fatal", result.Status)
+			}
+		})
 	}
 }
 

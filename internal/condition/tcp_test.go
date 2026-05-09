@@ -43,6 +43,18 @@ func TestTCPConditionRefused(t *testing.T) {
 	}
 }
 
+func TestTCPConditionInvalidAddressFatal(t *testing.T) {
+	tests := []string{"", "localhost", "localhost:"}
+	for _, address := range tests {
+		t.Run(address, func(t *testing.T) {
+			result := NewTCP(address).Check(t.Context())
+			if result.Status != CheckFatal {
+				t.Fatalf("status = %s, want fatal", result.Status)
+			}
+		})
+	}
+}
+
 func TestTCPConditionDescriptor(t *testing.T) {
 	c := NewTCP("localhost:5432")
 	d := c.Descriptor()

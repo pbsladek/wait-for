@@ -39,6 +39,40 @@ func TestValidateDNSName(t *testing.T) {
 	}
 }
 
+func TestNormalizeDNSServer(t *testing.T) {
+	tests := []struct {
+		name    string
+		server  string
+		want    string
+		wantErr bool
+	}{
+		{name: "empty"},
+		{name: "host without port", server: "dns.example.test", want: "dns.example.test:53"},
+		{name: "ipv4 without port", server: "192.0.2.53", want: "192.0.2.53:53"},
+		{name: "ipv6 without port", server: "2001:db8::53", want: "[2001:db8::53]:53"},
+		{name: "bracketed ipv6 without port", server: "[2001:db8::53]", want: "[2001:db8::53]:53"},
+		{name: "with port", server: "dns.example.test:5353", want: "dns.example.test:5353"},
+		{name: "blank port", server: "dns.example.test:", wantErr: true},
+		{name: "bad port", server: "dns.example.test:0", wantErr: true},
+		{name: "whitespace", server: " dns.example.test", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := NormalizeDNSServer(tt.server)
+			if tt.wantErr && err == nil {
+				t.Fatal("NormalizeDNSServer() expected error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("NormalizeDNSServer() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("NormalizeDNSServer() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDNSConditionARecordSatisfied(t *testing.T) {
 	cond := NewDNS("example.test")
 	cond.LookupIP = func(_ context.Context, network, host string) ([]net.IP, error) {
@@ -360,6 +394,75 @@ func TestDNSConditionWireARecordSatisfied(t *testing.T) {
 	result := cond.Check(t.Context())
 	if result.Status != CheckSatisfied {
 		t.Fatalf("status = %s, err = %v", result.Status, result.Err)
+	}
+}
+
+func TestDNSConditionWireNormalizesDirectServer(t *testing.T) {
+	cond := NewDNS("example.test")
+	cond.ResolverMode = DNSResolverWire
+	cond.Server = "192.0.2.53"
+	cond.WireExchange = func(_ context.Context, _ *wdns.Msg, _ string, server string) (*wdns.Msg, error) {
+		if server != "192.0.2.53:53" {
+			t.Fatalf("server = %q, want default port", server)
+		}
+		return wireResponse(wdns.RcodeSuccess, mustWireRR(t, "example.test. 60 IN A 192.0.2.10")), nil
+	}
+
+	result := cond.Check(t.Context())
+	if result.Status != CheckSatisfied {
+		t.Fatalf("status = %s, err = %v", result.Status, result.Err)
+	}
+}
+
+func TestDNSConditionInvalidDirectServerFatalBeforeExchange(t *testing.T) {
+	cond := NewDNS("example.test")
+	cond.ResolverMode = DNSResolverWire
+	cond.Server = "192.0.2.53:0"
+	cond.WireExchange = func(context.Context, *wdns.Msg, string, string) (*wdns.Msg, error) {
+		t.Fatal("WireExchange should not be called for invalid server")
+		return nil, nil
+	}
+
+	result := cond.Check(t.Context())
+	if result.Status != CheckFatal {
+		t.Fatalf("status = %s, want fatal", result.Status)
+	}
+}
+
+func TestDNSConditionWireUDPSizeDefaultsOnlyWhenEDNS0Enabled(t *testing.T) {
+	tests := []struct {
+		name    string
+		setup   func(*DNSCondition)
+		wantUDP uint16
+	}{
+		{name: "default", wantUDP: 0},
+		{name: "edns0 default size", setup: func(c *DNSCondition) {
+			c.EDNS0 = true
+		}, wantUDP: wdns.DefaultMsgSize},
+		{name: "explicit size", setup: func(c *DNSCondition) {
+			c.UDPSize = 1232
+		}, wantUDP: 1232},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cond := NewDNS("example.test")
+			cond.ResolverMode = DNSResolverWire
+			cond.Server = "192.0.2.53"
+			if tt.setup != nil {
+				tt.setup(cond)
+			}
+			cond.WireExchange = func(_ context.Context, msg *wdns.Msg, _ string, _ string) (*wdns.Msg, error) {
+				if msg.UDPSize != tt.wantUDP {
+					t.Fatalf("UDPSize = %d, want %d", msg.UDPSize, tt.wantUDP)
+				}
+				return wireResponse(wdns.RcodeSuccess, mustWireRR(t, "example.test. 60 IN A 192.0.2.10")), nil
+			}
+
+			result := cond.Check(t.Context())
+			if result.Status != CheckSatisfied {
+				t.Fatalf("status = %s, err = %v", result.Status, result.Err)
+			}
+		})
 	}
 }
 

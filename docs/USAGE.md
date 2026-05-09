@@ -13,9 +13,9 @@ waitfor http https://api.example.com/health --status 200
 ```
 
 ```
-checking 1 condition (timeout 5m, interval 2s)
-[ok] http https://api.example.com/health — status 200
-conditions satisfied in 4.1s
+[waitfor] checking 1 condition(s) (timeout: 5m0s, interval: 2s)
+[waitfor] [ok] http https://api.example.com/health (attempt 3, 4.1s) status 200
+[waitfor] conditions satisfied in 4.100s
 ```
 
 The process exits `0`. Chain the next step directly:
@@ -582,14 +582,14 @@ waitfor http http://api:8080/health
 ./start-app.sh
 ```
 
-**Combining JSON output with `tee`.** Capture JSON while also showing text
-progress on the terminal:
+**Capturing JSON output.** In JSON mode, stdout contains the final report and
+stderr stays quiet so scripts can parse the report directly:
 
 ```bash
 waitfor --output json http https://api.example.com/health \
   > result.json
-# stderr (text progress) still goes to the terminal
 # stdout (JSON) goes to result.json
+# stderr is empty unless argument parsing or report writing fails
 ```
 
 **Makefile integration.** Use `waitfor` as a make target dependency:

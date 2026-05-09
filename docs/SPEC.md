@@ -66,6 +66,9 @@ waitfor log /var/log/app.log --contains -- -- http https://api.example.com
 | ---- | ------- | ------- |
 | `--timeout duration` | `5m` | Global deadline for the run. |
 | `--interval duration` | `2s` | Delay between poll attempts. |
+| `--backoff constant\|exponential` | `constant` | Poll interval strategy. |
+| `--max-interval duration` | `--interval` | Maximum interval when exponential backoff is enabled. |
+| `--jitter percent` | `0` | Randomized interval jitter, e.g. `20%` or `0.2`. |
 | `--attempt-timeout duration` | `0` (disabled) | Per-attempt deadline; `0` means each attempt receives the remaining global time. |
 | `--successes N` | `1` | Consecutive successful checks required before a non-guard condition is complete. |
 | `--stable-for duration` | `0` (disabled) | Required continuous success duration before a non-guard condition is complete. |
@@ -372,6 +375,9 @@ type Config struct {
     Conditions        []condition.Condition
     Timeout           time.Duration
     Interval          time.Duration
+    MaxInterval       time.Duration
+    Backoff           Backoff       // BackoffConstant | BackoffExponential
+    Jitter            float64
     PerAttemptTimeout time.Duration
     RequiredSuccesses int
     StableFor         time.Duration
@@ -421,6 +427,9 @@ JSON schema (stable):
   "elapsed_seconds": 1.2,
   "timeout_seconds": 300.0,
   "interval_seconds": 2.0,
+  "max_interval_seconds": 8.0,
+  "backoff": "exponential",
+  "jitter": 0.2,
   "per_attempt_timeout_seconds": 5.0,
   "required_successes": 3,
   "stable_for_seconds": 10.0,
@@ -441,6 +450,8 @@ JSON schema (stable):
 }
 ```
 
+`max_interval_seconds` is omitted when it equals `interval_seconds`; `backoff`
+is omitted for the constant strategy; `jitter` is omitted when zero.
 `per_attempt_timeout_seconds` is omitted when the per-attempt timeout is zero.
 `required_successes` is omitted when it is `1`; `stable_for_seconds` is omitted
 when the stable duration is zero. `guard` is omitted or false for normal
@@ -488,5 +499,5 @@ otherwise its last detail.
    individual findings with `// #nosec GXXX -- <reason>` and a justification;
    never disable the linter globally.
 
-7. **CI gates.** Coverage must stay at or above 90% total. The lint and gosec
-   passes must both be clean before merge.
+7. **CI gates.** Coverage must stay at or above 90% total. The lint, gosec,
+   and gocyclo `-over 9` passes must be clean before merge.

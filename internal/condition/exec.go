@@ -34,11 +34,8 @@ func (c *ExecCondition) Descriptor() Descriptor {
 }
 
 func (c *ExecCondition) Check(ctx context.Context) Result {
-	if len(c.Command) == 0 || c.Command[0] == "" {
-		return Fatal(fmt.Errorf("exec command is required"))
-	}
-	if c.ExpectedExitCode < 0 {
-		return Fatal(fmt.Errorf("exec exit code cannot be negative"))
+	if err := validateExecConfig(c); err != nil {
+		return Fatal(err)
 	}
 
 	cmd := exec.CommandContext(ctx, c.Command[0], c.Command[1:]...) // #nosec G204 -- exec backend exists to run the caller-supplied command.
@@ -66,6 +63,19 @@ func (c *ExecCondition) Check(ctx context.Context) Result {
 
 	output, truncated := combinedExecOutput(&stdout, &stderr, c.MaxOutputBytes)
 	return checkExecOutput(output, stdout.Bytes(), truncated, exitCode, c)
+}
+
+func validateExecConfig(c *ExecCondition) error {
+	if len(c.Command) == 0 || c.Command[0] == "" {
+		return fmt.Errorf("exec command is required")
+	}
+	if c.ExpectedExitCode < 0 {
+		return fmt.Errorf("exec exit code cannot be negative")
+	}
+	if c.MaxOutputBytes <= 0 {
+		return fmt.Errorf("exec max output bytes must be positive")
+	}
+	return nil
 }
 
 // classifyRunError maps the error from cmd.Run() to either:

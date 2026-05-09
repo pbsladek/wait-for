@@ -449,7 +449,7 @@ func makeAttemptContext(ctx context.Context, timeout time.Duration) (context.Con
 }
 
 // updateRecord writes a single check result into the per-condition record.
-func updateRecord(record *ConditionResult, result condition.Result, conditionStart, globalStart time.Time) {
+func updateRecord(record *ConditionResult, result condition.Result, conditionStart time.Time) {
 	record.Elapsed = time.Since(conditionStart)
 	record.Detail = result.Detail
 	if result.Err != nil {
@@ -656,7 +656,7 @@ func runCondition(
 		done, shouldRecord := resultEndsCondition(result, cfg, record, cancel, readyRemaining, terminal)
 		if shouldRecord {
 			record.Attempts = attempt
-			updateRecord(record, result, conditionStart, start)
+			updateRecord(record, result, conditionStart)
 			attempts.emit(buildAttemptEvent(record, attempt, result, start))
 		}
 		if done {

@@ -48,6 +48,9 @@ func (c *KubernetesCondition) Descriptor() Descriptor {
 }
 
 func (c *KubernetesCondition) Check(ctx context.Context) Result {
+	if err := validateK8sConditionConfig(c); err != nil {
+		return Fatal(err)
+	}
 	if err := validateK8sResource(c.Resource, c.Selector); err != nil {
 		return Fatal(err)
 	}
@@ -73,6 +76,108 @@ func (c *KubernetesCondition) Check(ctx context.Context) Result {
 		conditionName = "Ready"
 	}
 	return checkK8sNamedCondition(obj, conditionName)
+}
+
+func validateK8sConditionConfig(c *KubernetesCondition) error {
+	if err := validateK8sMatchers(c); err != nil {
+		return err
+	}
+	if err := validateK8sSelectorConfig(c); err != nil {
+		return err
+	}
+	return validateK8sWaitForConfig(c)
+}
+
+func validateK8sMatchers(c *KubernetesCondition) error {
+	matchers := 0
+	if c.Condition != "" {
+		matchers++
+	}
+	if c.WaitFor != "" {
+		matchers++
+	}
+	if c.JSONExpr != nil {
+		matchers++
+	}
+	if matchers > 1 {
+		return fmt.Errorf("kubernetes matchers are mutually exclusive")
+	}
+	return nil
+}
+
+func validateK8sSelectorConfig(c *KubernetesCondition) error {
+	switch {
+	case c.Selector != "" && c.WaitFor == "":
+		return fmt.Errorf("kubernetes selector requires wait type")
+	case c.All && c.Selector == "":
+		return fmt.Errorf("kubernetes all requires selector")
+	default:
+		return nil
+	}
+}
+
+func validateK8sWaitForConfig(c *KubernetesCondition) error {
+	if c.WaitFor == "" {
+		return nil
+	}
+	if !validK8sWaitFor(c.WaitFor) {
+		return fmt.Errorf("unsupported kubernetes wait type %q", c.WaitFor)
+	}
+	kind := c.Resource
+	if c.Selector == "" {
+		parsedKind, _, err := splitKubernetesResource(c.Resource)
+		if err != nil {
+			return err
+		}
+		kind = parsedKind
+	}
+	if !k8sWaitSupportsKind(c.WaitFor, kind) {
+		return fmt.Errorf("kubernetes wait type %q is not supported for resource kind %q", c.WaitFor, kind)
+	}
+	return nil
+}
+
+func validK8sWaitFor(waitFor string) bool {
+	switch waitFor {
+	case "ready", "rollout", "complete":
+		return true
+	default:
+		return false
+	}
+}
+
+func k8sWaitSupportsKind(waitFor, kind string) bool {
+	switch waitFor {
+	case "ready":
+		return k8sKindMatches(kind, "pod")
+	case "rollout":
+		return k8sKindMatches(kind, "deployment") || k8sKindMatches(kind, "statefulset") || k8sKindMatches(kind, "daemonset")
+	case "complete":
+		return k8sKindMatches(kind, "job")
+	default:
+		return false
+	}
+}
+
+func k8sKindMatches(kind, canonical string) bool {
+	return normalizeK8sKind(kind) == canonical
+}
+
+func normalizeK8sKind(kind string) string {
+	switch strings.ToLower(kind) {
+	case "pod", "pods", "po":
+		return "pod"
+	case "deployment", "deployments", "deploy":
+		return "deployment"
+	case "statefulset", "statefulsets", "sts":
+		return "statefulset"
+	case "daemonset", "daemonsets", "ds":
+		return "daemonset"
+	case "job", "jobs":
+		return "job"
+	default:
+		return strings.ToLower(kind)
+	}
 }
 
 func validateK8sResource(resource string, selector string) error {

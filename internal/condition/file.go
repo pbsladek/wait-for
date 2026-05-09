@@ -29,7 +29,7 @@ func NewFile(path string, state FileState) *FileCondition {
 }
 
 func (c *FileCondition) Descriptor() Descriptor {
-	return Descriptor{Backend: "file", Target: c.Path, Name: fmt.Sprintf("file %s %s", c.Path, c.State)}
+	return Descriptor{Backend: "file", Target: c.Path}
 }
 
 func (c *FileCondition) Check(ctx context.Context) Result {
@@ -54,6 +54,14 @@ func (c *FileCondition) Check(ctx context.Context) Result {
 }
 
 func validateFileConfig(c *FileCondition) error {
+	if c.Path == "" {
+		return fmt.Errorf("file path is required")
+	}
+	switch c.State {
+	case FileExists, FileDeleted, FileNonEmpty:
+	default:
+		return fmt.Errorf("unsupported file state %q", c.State)
+	}
 	if c.State == FileDeleted && c.Contains != "" {
 		return fmt.Errorf("--deleted cannot be combined with --contains")
 	}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -99,7 +100,6 @@ func NewDNS(host string) *DNSCondition {
 		ResolverMode: DNSResolverSystem,
 		AbsentMode:   DNSAbsentAny,
 		Transport:    DNSTransportUDP,
-		UDPSize:      wdns.DefaultMsgSize,
 	}
 }
 
@@ -125,6 +125,11 @@ func (c *DNSCondition) validate() error {
 	if err := validateDNSName(c.Host); err != nil {
 		return err
 	}
+	server, err := NormalizeDNSServer(c.Server)
+	if err != nil {
+		return err
+	}
+	c.Server = server
 	if !validDNSRecordType(c.recordType()) {
 		return fmt.Errorf("unsupported dns record type %q", c.RecordType)
 	}
@@ -616,6 +621,72 @@ func validateDNSName(name string) error {
 		return nil
 	}
 	return validateDNSLabels(strings.Split(trimmed, "."))
+}
+
+func NormalizeDNSServer(server string) (string, error) {
+	if server == "" {
+		return "", nil
+	}
+	if strings.TrimSpace(server) != server {
+		return "", fmt.Errorf("invalid dns server address %q", server)
+	}
+	if host, port, err := net.SplitHostPort(server); err == nil {
+		return validateDNSServerHostPort(server, host, port)
+	}
+	return parseDNSServerWithoutPort(server)
+}
+
+func parseDNSServerWithoutPort(server string) (string, error) {
+	if strings.HasPrefix(server, "[") && strings.HasSuffix(server, "]") {
+		host := strings.TrimSuffix(strings.TrimPrefix(server, "["), "]")
+		return defaultDNSServerPort(server, host)
+	}
+	if isBareIPv6Address(server) {
+		return defaultDNSServerPort(server, server)
+	}
+	if strings.Contains(server, ":") {
+		return "", fmt.Errorf("invalid dns server address %q", server)
+	}
+	return defaultDNSServerPort(server, server)
+}
+
+func defaultDNSServerPort(server, host string) (string, error) {
+	if err := validateDNSServerHost(server, host); err != nil {
+		return "", err
+	}
+	return net.JoinHostPort(host, "53"), nil
+}
+
+func validateDNSServerHostPort(server, host, port string) (string, error) {
+	if err := validateDNSServerHost(server, host); err != nil {
+		return "", err
+	}
+	if port == "" {
+		return "", fmt.Errorf("invalid dns server address %q", server)
+	}
+	if err := validateDNSPort(port); err != nil {
+		return "", fmt.Errorf("invalid dns server address %q: %w", server, err)
+	}
+	return server, nil
+}
+
+func validateDNSServerHost(server, host string) error {
+	if host == "" || containsSpaceOrControl(host) {
+		return fmt.Errorf("invalid dns server address %q", server)
+	}
+	return nil
+}
+
+func validateDNSPort(port string) error {
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("port must be between 1 and 65535")
+	}
+	return nil
+}
+
+func isBareIPv6Address(server string) bool {
+	return strings.Contains(server, ":") && strings.Count(server, ":") > 1
 }
 
 func validateDNSLabels(labels []string) error {

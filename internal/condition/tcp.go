@@ -2,6 +2,7 @@ package condition
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"time"
 )
@@ -20,6 +21,9 @@ func (c *TCPCondition) Descriptor() Descriptor {
 }
 
 func (c *TCPCondition) Check(ctx context.Context) Result {
+	if err := validateTCPConfig(c); err != nil {
+		return Fatal(err)
+	}
 	timeout := c.AttemptTimeout
 	if timeout <= 0 {
 		timeout = 2 * time.Second
@@ -31,4 +35,18 @@ func (c *TCPCondition) Check(ctx context.Context) Result {
 	}
 	_ = conn.Close()
 	return Satisfied("connection established")
+}
+
+func validateTCPConfig(c *TCPCondition) error {
+	if c.Address == "" {
+		return fmt.Errorf("tcp address is required")
+	}
+	_, port, err := net.SplitHostPort(c.Address)
+	if err != nil {
+		return fmt.Errorf("invalid tcp address %q: %w", c.Address, err)
+	}
+	if port == "" {
+		return fmt.Errorf("invalid tcp address %q: missing port", c.Address)
+	}
+	return nil
 }

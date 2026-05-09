@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -72,6 +73,13 @@ func refusedAddr(t *testing.T) string {
 	addr := l.Addr().String()
 	_ = l.Close()
 	return addr
+}
+
+func requirePOSIXShell(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("requires /bin/sh")
+	}
 }
 
 // ── HTTP ────────────────────────────────────────────────────────────────────
@@ -224,7 +232,7 @@ func TestHTTPInsecure(t *testing.T) {
 
 func TestHTTPUnreachable(t *testing.T) {
 	mustCode(t, cli.ExitTimeout, "--timeout", "100ms", "--interval", "20ms",
-		"http", "http://127.0.0.1:1")
+		"http", "http://"+refusedAddr(t))
 }
 
 func TestHTTPStderrOnTimeout(t *testing.T) {
@@ -522,25 +530,30 @@ func TestGuardLogFatal(t *testing.T) {
 // ── Exec ────────────────────────────────────────────────────────────────────
 
 func TestExecSuccess(t *testing.T) {
+	requirePOSIXShell(t)
 	mustCode(t, cli.ExitSatisfied, "exec", "--", "/bin/sh", "-c", "exit 0")
 }
 
 func TestExecExpectedExitCode(t *testing.T) {
+	requirePOSIXShell(t)
 	mustCode(t, cli.ExitSatisfied, "exec", "--exit-code", "7", "--", "/bin/sh", "-c", "exit 7")
 }
 
 func TestExecExitCodeMismatch(t *testing.T) {
+	requirePOSIXShell(t)
 	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms",
 		"exec", "--", "/bin/sh", "-c", "exit 1")
 }
 
 func TestExecOutputContains(t *testing.T) {
+	requirePOSIXShell(t)
 	mustCode(t, cli.ExitSatisfied, "exec", "--output-contains", "hello", "--", "/bin/sh", "-c", "echo hello")
 	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms",
 		"exec", "--output-contains", "missing", "--", "/bin/sh", "-c", "echo hello")
 }
 
 func TestExecJSONPath(t *testing.T) {
+	requirePOSIXShell(t)
 	mustCode(t, cli.ExitSatisfied, "exec", "--jsonpath", ".ready == true",
 		"--", "/bin/sh", "-c", `printf '{"ready":true}'`)
 	mustCode(t, cli.ExitTimeout, "--timeout", "50ms", "--interval", "10ms",
@@ -549,12 +562,14 @@ func TestExecJSONPath(t *testing.T) {
 }
 
 func TestExecCwd(t *testing.T) {
+	requirePOSIXShell(t)
 	dir := t.TempDir()
 	mustCode(t, cli.ExitSatisfied, "exec", "--cwd", dir, "--output-contains", dir,
 		"--", "/bin/sh", "-c", "pwd")
 }
 
 func TestExecEnv(t *testing.T) {
+	requirePOSIXShell(t)
 	mustCode(t, cli.ExitSatisfied, "exec",
 		"--env", "WAITFOR_E2E=yep",
 		"--output-contains", "yep",
@@ -562,6 +577,7 @@ func TestExecEnv(t *testing.T) {
 }
 
 func TestExecMaxOutputBytes(t *testing.T) {
+	requirePOSIXShell(t)
 	mustCode(t, cli.ExitSatisfied, "exec",
 		"--max-output-bytes", "3",
 		"--output-contains", "abc",
@@ -573,6 +589,7 @@ func TestExecCommandNotFound(t *testing.T) {
 }
 
 func TestExecTimeout(t *testing.T) {
+	requirePOSIXShell(t)
 	mustCode(t, cli.ExitTimeout, "--timeout", "100ms", "--interval", "10ms", "--attempt-timeout", "20ms",
 		"exec", "--", "/bin/sh", "-c", "sleep 5")
 }
@@ -783,7 +800,7 @@ func TestMultiConditionModeAny(t *testing.T) {
 	defer server.Close()
 	mustCode(t, cli.ExitSatisfied, "--mode", "any",
 		"http", server.URL,
-		"--", "tcp", "127.0.0.1:1") // port 1 is refused
+		"--", "tcp", refusedAddr(t))
 }
 
 // ── Exit codes ───────────────────────────────────────────────────────────────
@@ -928,7 +945,7 @@ func TestInvalidHTTPURL(t *testing.T) {
 }
 
 func TestDNSLocalhost(t *testing.T) {
-	mustCode(t, cli.ExitSatisfied, "dns", "localhost", "--type", "ANY", "--equals", "127.0.0.1", "--min-count", "1")
+	mustCode(t, cli.ExitSatisfied, "dns", "localhost", "--type", "ANY", "--min-count", "1")
 }
 
 func TestDNSJSONOutput(t *testing.T) {

@@ -72,6 +72,24 @@ func TestFileDeletedWithContainsFatal(t *testing.T) {
 	}
 }
 
+func TestFileInvalidDirectConfigFatal(t *testing.T) {
+	tests := []struct {
+		name string
+		cond *FileCondition
+	}{
+		{name: "empty path", cond: NewFile("", FileExists)},
+		{name: "unknown state", cond: NewFile(filepath.Join(t.TempDir(), "ready"), FileState("ready"))},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.cond.Check(t.Context())
+			if result.Status != CheckFatal {
+				t.Fatalf("status = %s, want fatal", result.Status)
+			}
+		})
+	}
+}
+
 func TestFileContainsNotFound(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "log")
 	if err := os.WriteFile(path, []byte("nothing here"), 0o600); err != nil {
@@ -142,5 +160,8 @@ func TestFileDescriptor(t *testing.T) {
 	}
 	if d.Target != "/tmp/f" {
 		t.Fatalf("Target = %q, want /tmp/f", d.Target)
+	}
+	if d.Name != "" {
+		t.Fatalf("Name = %q, want empty backend default", d.Name)
 	}
 }

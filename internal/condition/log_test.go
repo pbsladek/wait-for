@@ -20,6 +20,57 @@ func TestLogMissingFile(t *testing.T) {
 	}
 }
 
+func TestLogInvalidDirectConfigFatal(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*LogCondition)
+	}{
+		{"no matcher", func(*LogCondition) {}},
+		{"from start with tail", func(c *LogCondition) {
+			c.Contains = "ready"
+			c.FromStart = true
+			c.Tail = 1
+		}},
+		{"negative tail", func(c *LogCondition) {
+			c.Contains = "ready"
+			c.Tail = -1
+		}},
+		{"zero min matches", func(c *LogCondition) {
+			c.Contains = "ready"
+			c.MinMatches = 0
+		}},
+		{"empty path", func(c *LogCondition) {
+			c.Path = ""
+			c.Contains = "ready"
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := NewLog(filepath.Join(t.TempDir(), "app.log"))
+			tt.setup(c)
+
+			result := c.Check(t.Context())
+			if result.Status != CheckFatal {
+				t.Fatalf("status = %s, want fatal", result.Status)
+			}
+		})
+	}
+}
+
+func TestLogDescriptorUsesBackendAndTargetOnly(t *testing.T) {
+	c := NewLog("/var/log/app.log")
+	d := c.Descriptor()
+	if d.Backend != "log" || d.Target != "/var/log/app.log" {
+		t.Fatalf("descriptor = %+v", d)
+	}
+	if d.Name != "" {
+		t.Fatalf("Name = %q, want empty backend default", d.Name)
+	}
+	if got := d.DisplayName(); got != "log /var/log/app.log" {
+		t.Fatalf("DisplayName() = %q, want backend target", got)
+	}
+}
+
 func TestLogContainsFromStart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "app.log")
 	if err := os.WriteFile(path, []byte("service: ready\nother line\n"), 0o600); err != nil {
