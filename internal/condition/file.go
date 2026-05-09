@@ -29,7 +29,7 @@ func NewFile(path string, state FileState) *FileCondition {
 }
 
 func (c *FileCondition) Descriptor() Descriptor {
-	return Descriptor{Backend: "file", Target: c.Path, Name: fmt.Sprintf("file %s %s", c.Path, c.State)}
+	return Descriptor{Backend: "file", Target: c.Path}
 }
 
 func (c *FileCondition) Check(ctx context.Context) Result {
@@ -39,16 +39,46 @@ func (c *FileCondition) Check(ctx context.Context) Result {
 	default:
 	}
 
+	if err := validateFileConfig(c); err != nil {
+		return Fatal(err)
+	}
+
 	info, err := os.Stat(c.Path)
 	if c.State == FileDeleted {
 		return checkFileDeleted(err)
 	}
+	if err != nil {
+		return checkFileStatError(err)
+	}
+	return checkExistingFile(ctx, c, info)
+}
+
+func validateFileConfig(c *FileCondition) error {
+	if c.Path == "" {
+		return fmt.Errorf("file path is required")
+	}
+	switch c.State {
+	case FileExists, FileDeleted, FileNonEmpty:
+	default:
+		return fmt.Errorf("unsupported file state %q", c.State)
+	}
+	if c.State == FileDeleted && c.Contains != "" {
+		return fmt.Errorf("--deleted cannot be combined with --contains")
+	}
+	return nil
+}
+
+func checkFileStatError(err error) Result {
 	if err != nil {
 		if os.IsNotExist(err) {
 			return Unsatisfied("file does not exist", err)
 		}
 		return Unsatisfied("", err)
 	}
+	return Satisfied("exists")
+}
+
+func checkExistingFile(ctx context.Context, c *FileCondition, info os.FileInfo) Result {
 	if c.State == FileNonEmpty && info.Size() == 0 {
 		return Unsatisfied("file is empty", fmt.Errorf("file is empty"))
 	}

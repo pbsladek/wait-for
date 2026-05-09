@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -75,7 +76,7 @@ func newCommand(stdin io.Reader, stdout io.Writer, stderr io.Writer) *cobra.Comm
 		SilenceErrors:      true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if isDoctorCommand(args) {
-				code, err := runDoctor(args[1:], stdout, stderr)
+				code, err := runDoctor(cmd.Context(), args[1:], stdout, stderr)
 				if err != nil {
 					return exitError{code: code, err: err}
 				}
@@ -128,13 +129,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		return ExitInvalid, err
 	}
 
-	outputWriter := stderr
-	if opts.format == output.FormatJSON {
-		outputWriter = stdout
-	}
-	printer := output.NewPrinter(outputWriter, opts.format, opts.verbose)
-	printer.Start(len(conditions), opts.timeout, opts.interval)
-	out, err := runner.Run(ctx, runner.Config{
+	runCfg := runner.Config{
 		Conditions:        conditions,
 		Timeout:           opts.timeout,
 		Interval:          opts.interval,
@@ -145,32 +140,47 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		RequiredSuccesses: opts.requiredSuccesses,
 		StableFor:         opts.stableFor,
 		Mode:              opts.mode,
-		OnAttempt: func(event runner.AttemptEvent) {
-			printer.Attempt(output.Attempt{
-				Name:      event.Name,
-				Attempt:   event.Attempt,
-				Satisfied: event.Satisfied,
-				Detail:    event.Detail,
-				Error:     event.Error,
-				Elapsed:   event.Elapsed,
-			})
-		},
-	})
+	}
+	if err := runner.ValidateConfig(runCfg); err != nil {
+		return ExitInvalid, err
+	}
+
+	outputWriter := stderr
+	if opts.format == output.FormatJSON {
+		outputWriter = stdout
+	}
+	printer := output.NewPrinter(outputWriter, opts.format, opts.verbose)
+	printer.Start(len(conditions), opts.timeout, opts.interval)
+	runCfg.OnAttempt = func(event runner.AttemptEvent) {
+		printer.Attempt(output.Attempt{
+			Name:      event.Name,
+			Attempt:   event.Attempt,
+			Satisfied: event.Satisfied,
+			Detail:    event.Detail,
+			Error:     event.Error,
+			Elapsed:   event.Elapsed,
+		})
+	}
+	out, err := runner.Run(ctx, runCfg)
 	if err != nil {
 		return ExitInvalid, err
 	}
 	if err := printer.Outcome(reportFromOutcome(out)); err != nil {
 		return ExitFatal, err
 	}
-	switch out.Status {
+	return exitCodeForStatus(out.Status), nil
+}
+
+func exitCodeForStatus(status runner.Status) int {
+	switch status {
 	case runner.StatusSatisfied:
-		return ExitSatisfied, nil
+		return ExitSatisfied
 	case runner.StatusFatal:
-		return ExitFatal, nil
+		return ExitFatal
 	case runner.StatusCancelled:
-		return ExitCancelled, nil
+		return ExitCancelled
 	default:
-		return ExitTimeout, nil
+		return ExitTimeout
 	}
 }
 
@@ -224,7 +234,7 @@ func validateBackoffOptions(opts globalOptions) error {
 	if opts.backoff != runner.BackoffConstant && opts.backoff != runner.BackoffExponential {
 		return fmt.Errorf("invalid backoff %q", opts.backoff)
 	}
-	if opts.jitter < 0 || opts.jitter > 1 {
+	if math.IsNaN(opts.jitter) || math.IsInf(opts.jitter, 0) || opts.jitter < 0 || opts.jitter > 1 {
 		return fmt.Errorf("jitter must be between 0 and 100%%")
 	}
 	return nil
@@ -455,9 +465,52 @@ func parseHTTPHeaders(rawHeaders []string) (map[string]string, error) {
 		if !ok {
 			return nil, fmt.Errorf("invalid header; must use Key: Value or Key=Value")
 		}
+		if !validHTTPHeaderName(key) {
+			return nil, fmt.Errorf("invalid HTTP header name %q", key)
+		}
+		if !validHTTPHeaderValue(value) {
+			return nil, fmt.Errorf("invalid HTTP header value for %q", key)
+		}
 		headers[key] = value
 	}
 	return headers, nil
+}
+
+func validHTTPHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if !isHTTPTokenChar(name[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isHTTPTokenChar(ch byte) bool {
+	if ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' {
+		return true
+	}
+	switch ch {
+	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	default:
+		return false
+	}
+}
+
+func validHTTPHeaderValue(value string) bool {
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if ch == '\t' {
+			continue
+		}
+		if ch < 0x20 || ch == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 func compileHTTPBodyMatchers(bodyMatches, jsonpath string) (*regexp.Regexp, *expr.Expression, error) {
@@ -601,6 +654,9 @@ func parseDNSCondition(segment []string) (condition.Condition, error) {
 	if len(args) != 1 {
 		return nil, fmt.Errorf("dns requires exactly one HOST")
 	}
+	if err := condition.ValidateDNSName(args[0]); err != nil {
+		return nil, fmt.Errorf("invalid dns name: %w", err)
+	}
 	opts, serverAddr, err := normalizeDNSOptions(opts)
 	if err != nil {
 		return nil, err
@@ -649,7 +705,7 @@ func normalizeDNSOptions(opts dnsParseOptions) (dnsParseOptions, string, error) 
 	if err := validateDNSWireOptions(opts); err != nil {
 		return opts, "", err
 	}
-	serverAddr, err := parseDNSServer(opts.server)
+	serverAddr, err := condition.NormalizeDNSServer(opts.server)
 	if err != nil {
 		return opts, "", err
 	}
@@ -746,36 +802,6 @@ func systemDNSRecordType(recordType condition.DNSRecordType) bool {
 	}
 }
 
-func parseDNSServer(server string) (string, error) {
-	if server == "" {
-		return "", nil
-	}
-	if host, port, err := net.SplitHostPort(server); err == nil {
-		return validateDNSServerHostPort(server, host, port)
-	}
-	if strings.HasPrefix(server, "[") && strings.HasSuffix(server, "]") {
-		return net.JoinHostPort(strings.Trim(server, "[]"), "53"), nil
-	}
-	if isBareIPv6Address(server) {
-		return net.JoinHostPort(server, "53"), nil
-	}
-	if strings.Contains(server, ":") {
-		return "", fmt.Errorf("invalid dns server address %q", server)
-	}
-	return net.JoinHostPort(server, "53"), nil
-}
-
-func validateDNSServerHostPort(server, host, port string) (string, error) {
-	if host == "" || port == "" {
-		return "", fmt.Errorf("invalid dns server address %q", server)
-	}
-	return server, nil
-}
-
-func isBareIPv6Address(server string) bool {
-	return strings.Contains(server, ":") && strings.Count(server, ":") > 1
-}
-
 func parseDockerCondition(segment []string) (condition.Condition, error) {
 	fs := pflag.NewFlagSet("docker", pflag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -840,6 +866,16 @@ func parseFileCondition(segment []string) (condition.Condition, error) {
 	if len(args) != 1 {
 		return nil, fmt.Errorf("file requires exactly one PATH")
 	}
+	state, err := parseFileState(existsFlag, deletedFlag, nonemptyFlag, contains)
+	if err != nil {
+		return nil, err
+	}
+	cond := condition.NewFile(args[0], state)
+	cond.Contains = contains
+	return cond, nil
+}
+
+func parseFileState(existsFlag, deletedFlag, nonemptyFlag bool, contains string) (condition.FileState, error) {
 	set := 0
 	if existsFlag {
 		set++
@@ -851,7 +887,10 @@ func parseFileCondition(segment []string) (condition.Condition, error) {
 		set++
 	}
 	if set > 1 {
-		return nil, fmt.Errorf("--exists, --deleted, and --nonempty are mutually exclusive")
+		return "", fmt.Errorf("--exists, --deleted, and --nonempty are mutually exclusive")
+	}
+	if deletedFlag && contains != "" {
+		return "", fmt.Errorf("--deleted cannot be combined with --contains")
 	}
 	state := condition.FileExists
 	switch {
@@ -860,9 +899,7 @@ func parseFileCondition(segment []string) (condition.Condition, error) {
 	case nonemptyFlag:
 		state = condition.FileNonEmpty
 	}
-	cond := condition.NewFile(args[0], state)
-	cond.Contains = contains
-	return cond, nil
+	return state, nil
 }
 
 func parseLogCondition(segment []string) (condition.Condition, error) {
@@ -1205,6 +1242,8 @@ var conditionValueFlags = map[string]bool{
 	"--contains":         true,
 	"--matches":          true,
 	"--exclude":          true,
+	"--tail":             true,
+	"--min-matches":      true,
 	"--equals":           true,
 	"--min-count":        true,
 	"--absent-mode":      true,

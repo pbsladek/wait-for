@@ -2,6 +2,7 @@ package condition
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -53,6 +54,20 @@ func TestExecConditionNegativeExpectedExitCodeFatal(t *testing.T) {
 	}
 }
 
+func TestExecConditionInvalidOutputLimitFatal(t *testing.T) {
+	for _, limit := range []int64{0, -1} {
+		t.Run(fmt.Sprintf("limit %d", limit), func(t *testing.T) {
+			cond := NewExec([]string{"/bin/sh", "-c", "printf ok"})
+			cond.MaxOutputBytes = limit
+
+			result := cond.Check(t.Context())
+			if result.Status != CheckFatal {
+				t.Fatalf("status = %s, want fatal", result.Status)
+			}
+		})
+	}
+}
+
 func TestClassifyRunErrorContextCancellationBeatsExitError(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses /bin/sh")
@@ -83,11 +98,11 @@ func TestExecConditionDefaultOutputLimit(t *testing.T) {
 
 func TestExecConditionCwdEnvAndOutputLimit(t *testing.T) {
 	dir := t.TempDir()
-	cond := NewExec([]string{"/bin/sh", "-c", "printf '%s:%s:abcdef' \"$PWD\" \"$WAITFOR_TEST\""})
+	cond := NewExec([]string{"/bin/sh", "-c", "test -d \"$PWD\" && test \"$WAITFOR_TEST\" = yes && printf ':yes:abcdef'"})
 	cond.Cwd = dir
 	cond.Env = []string{"WAITFOR_TEST=yes"}
 	cond.OutputContains = ":yes:abc"
-	cond.MaxOutputBytes = int64(len(dir) + len(":yes:abc"))
+	cond.MaxOutputBytes = int64(len(":yes:abc"))
 
 	result := cond.Check(t.Context())
 	if result.Status != CheckSatisfied {
@@ -105,6 +120,16 @@ func TestExecConditionInvalidJSONOutputUnsatisfied(t *testing.T) {
 	}
 	if result.Err == nil || !strings.Contains(result.Err.Error(), "parse json") {
 		t.Fatalf("err = %v, want parse json error", result.Err)
+	}
+}
+
+func TestExecConditionJSONPathUsesStdoutOnly(t *testing.T) {
+	cond := NewExec([]string{"/bin/sh", "-c", "printf '{\"ready\":true}\\n'; printf 'warning\\n' >&2"})
+	cond.OutputJSONExpr = expr.MustCompile(".ready == true")
+
+	result := cond.Check(t.Context())
+	if result.Status != CheckSatisfied {
+		t.Fatalf("status = %s, want satisfied; err = %v detail = %q", result.Status, result.Err, result.Detail)
 	}
 }
 
@@ -164,6 +189,16 @@ func TestExecOutputContainsDetailDoesNotExposeSecret(t *testing.T) {
 	}
 	if strings.Contains(result.Detail, "secret-token") {
 		t.Fatalf("Detail = %q leaked secret", result.Detail)
+	}
+}
+
+func TestExecOutputContainsChecksStderr(t *testing.T) {
+	cond := NewExec([]string{"/bin/sh", "-c", "printf warning >&2"})
+	cond.OutputContains = "warning"
+
+	result := cond.Check(t.Context())
+	if result.Status != CheckSatisfied {
+		t.Fatalf("Status = %s, err = %v", result.Status, result.Err)
 	}
 }
 

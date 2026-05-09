@@ -92,10 +92,10 @@ func (c *HTTPCondition) Descriptor() Descriptor {
 }
 
 func (c *HTTPCondition) Check(ctx context.Context) Result {
-	method := c.Method
-	if method == "" {
-		method = http.MethodGet
+	if err := validateHTTPConfig(c); err != nil {
+		return Fatal(err)
 	}
+	method := c.method()
 	statusMatcher := c.statusMatcher()
 
 	var reqBody io.Reader
@@ -130,6 +130,121 @@ func (c *HTTPCondition) Check(ctx context.Context) Result {
 	}
 
 	return c.checkResponseBody(body, resp.StatusCode)
+}
+
+func validateHTTPConfig(c *HTTPCondition) error {
+	if err := validateHTTPURL(c.URL); err != nil {
+		return err
+	}
+	if !validHTTPToken(c.method()) {
+		return fmt.Errorf("invalid HTTP method")
+	}
+	if err := validateHTTPStatusConfig(c); err != nil {
+		return err
+	}
+	return validateHTTPHeaders(c.Headers)
+}
+
+func validateHTTPURL(rawURL string) error {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("invalid HTTP URL")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("HTTP URL must use http or https")
+	}
+	return nil
+}
+
+func (c *HTTPCondition) method() string {
+	if c.Method == "" {
+		return http.MethodGet
+	}
+	return c.Method
+}
+
+func validateHTTPStatusConfig(c *HTTPCondition) error {
+	hasMatcher := c.StatusMatcher.raw != "" || c.StatusMatcher.exact != 0 || c.StatusMatcher.class != 0
+	if c.ExpectedStatus != 0 && hasMatcher {
+		return fmt.Errorf("HTTP expected status and status matcher are mutually exclusive")
+	}
+	if c.ExpectedStatus != 0 && !validHTTPStatusCode(c.ExpectedStatus) {
+		return fmt.Errorf("invalid HTTP status")
+	}
+	if !hasMatcher {
+		return nil
+	}
+	return validateHTTPStatusMatcher(c.StatusMatcher)
+}
+
+func validateHTTPStatusMatcher(m HTTPStatusMatcher) error {
+	if m.raw != "" {
+		_, err := ParseHTTPStatusMatcher(m.raw)
+		return err
+	}
+	if m.exact != 0 && m.class != 0 {
+		return fmt.Errorf("HTTP status matcher cannot set exact and class")
+	}
+	if m.exact != 0 && !validHTTPStatusCode(m.exact) {
+		return fmt.Errorf("invalid HTTP status")
+	}
+	if m.class != 0 && (m.class < 1 || m.class > 5) {
+		return fmt.Errorf("invalid HTTP status")
+	}
+	return nil
+}
+
+func validHTTPStatusCode(code int) bool {
+	return code >= 100 && code <= 599
+}
+
+func validateHTTPHeaders(headers map[string]string) error {
+	for key, value := range headers {
+		if !validHTTPToken(key) {
+			return fmt.Errorf("invalid HTTP header name %q", key)
+		}
+		if !validHTTPHeaderValue(value) {
+			return fmt.Errorf("invalid HTTP header value for %q", key)
+		}
+	}
+	return nil
+}
+
+func validHTTPToken(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if !isHTTPTokenChar(value[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isHTTPTokenChar(ch byte) bool {
+	if ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' {
+		return true
+	}
+	switch ch {
+	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	default:
+		return false
+	}
+}
+
+func validHTTPHeaderValue(value string) bool {
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if ch == '\t' {
+			continue
+		}
+		if ch < 0x20 || ch == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *HTTPCondition) checkResponseBody(body []byte, statusCode int) Result {

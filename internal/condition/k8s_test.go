@@ -384,6 +384,101 @@ func TestKubernetesConditionGetterError(t *testing.T) {
 	}
 }
 
+func TestKubernetesConditionPermanentGetterErrorsFatal(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "forbidden",
+			err:  apierrors.NewForbidden(schema.GroupResource{Resource: "pods"}, "myapp", fmt.Errorf("denied")),
+		},
+		{
+			name: "unauthorized",
+			err:  apierrors.NewUnauthorized("denied"),
+		},
+		{
+			name: "bad request",
+			err:  apierrors.NewBadRequest("invalid selector"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cond := NewKubernetes("pod/myapp")
+			cond.Getter = &errorGetter{tt.err}
+
+			result := cond.Check(t.Context())
+			if result.Status != CheckFatal {
+				t.Fatalf("status = %s, want fatal", result.Status)
+			}
+		})
+	}
+}
+
+func TestKubernetesConditionNotFoundGetterErrorRetryable(t *testing.T) {
+	cond := NewKubernetes("pod/missing")
+	cond.Getter = &errorGetter{apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, "missing")}
+
+	result := cond.Check(t.Context())
+	if result.Status != CheckUnsatisfied {
+		t.Fatalf("status = %s, want unsatisfied", result.Status)
+	}
+}
+
+func TestKubernetesConditionSelectorForbiddenFatal(t *testing.T) {
+	cond := NewKubernetes("pod")
+	cond.Getter = &listGetter{err: apierrors.NewForbidden(schema.GroupResource{Resource: "pods"}, "", fmt.Errorf("denied"))}
+	cond.Selector = "app=api"
+	cond.WaitFor = "ready"
+
+	result := cond.Check(t.Context())
+	if result.Status != CheckFatal {
+		t.Fatalf("status = %s, want fatal", result.Status)
+	}
+}
+
+func TestKubernetesConditionInvalidDirectConfigFatalBeforeGetter(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*KubernetesCondition)
+	}{
+		{"condition with jsonpath", func(c *KubernetesCondition) {
+			c.Condition = "Ready"
+			c.JSONExpr = expr.MustCompile(".status.phase == Running")
+		}},
+		{"wait for with condition", func(c *KubernetesCondition) {
+			c.WaitFor = "ready"
+			c.Condition = "Ready"
+		}},
+		{"selector without wait for", func(c *KubernetesCondition) {
+			c.Resource = "pod"
+			c.Selector = "app=api"
+		}},
+		{"all without selector", func(c *KubernetesCondition) {
+			c.All = true
+		}},
+		{"unsupported wait for", func(c *KubernetesCondition) {
+			c.WaitFor = "steady"
+		}},
+		{"unsupported wait kind", func(c *KubernetesCondition) {
+			c.Resource = "service/api"
+			c.WaitFor = "rollout"
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cond := NewKubernetes("pod/myapp")
+			cond.Getter = failOnUseGetter{t: t}
+			tt.setup(cond)
+
+			result := cond.Check(t.Context())
+			if result.Status != CheckFatal {
+				t.Fatalf("status = %s, want fatal", result.Status)
+			}
+		})
+	}
+}
+
 func TestKubernetesDescriptor(t *testing.T) {
 	cond := NewKubernetes("pod/myapp")
 	d := cond.Descriptor()
@@ -531,6 +626,20 @@ func (g *listGetter) Get(_ context.Context, _ string, _ string) (map[string]any,
 
 func (g *listGetter) List(_ context.Context, _ string, _ string, _ string) ([]map[string]any, error) {
 	return g.items, g.err
+}
+
+type failOnUseGetter struct {
+	t *testing.T
+}
+
+func (g failOnUseGetter) Get(context.Context, string, string) (map[string]any, error) {
+	g.t.Fatal("getter should not be called")
+	return nil, nil
+}
+
+func (g failOnUseGetter) List(context.Context, string, string, string) ([]map[string]any, error) {
+	g.t.Fatal("getter should not be called")
+	return nil, nil
 }
 
 func podObject(ready string) *unstructured.Unstructured {

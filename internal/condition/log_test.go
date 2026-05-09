@@ -1,6 +1,7 @@
 package condition
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -16,6 +17,57 @@ func TestLogMissingFile(t *testing.T) {
 	result := c.Check(t.Context())
 	if result.Status == CheckSatisfied {
 		t.Fatal("missing file should not be satisfied")
+	}
+}
+
+func TestLogInvalidDirectConfigFatal(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*LogCondition)
+	}{
+		{"no matcher", func(*LogCondition) {}},
+		{"from start with tail", func(c *LogCondition) {
+			c.Contains = "ready"
+			c.FromStart = true
+			c.Tail = 1
+		}},
+		{"negative tail", func(c *LogCondition) {
+			c.Contains = "ready"
+			c.Tail = -1
+		}},
+		{"zero min matches", func(c *LogCondition) {
+			c.Contains = "ready"
+			c.MinMatches = 0
+		}},
+		{"empty path", func(c *LogCondition) {
+			c.Path = ""
+			c.Contains = "ready"
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := NewLog(filepath.Join(t.TempDir(), "app.log"))
+			tt.setup(c)
+
+			result := c.Check(t.Context())
+			if result.Status != CheckFatal {
+				t.Fatalf("status = %s, want fatal", result.Status)
+			}
+		})
+	}
+}
+
+func TestLogDescriptorUsesBackendAndTargetOnly(t *testing.T) {
+	c := NewLog("/var/log/app.log")
+	d := c.Descriptor()
+	if d.Backend != "log" || d.Target != "/var/log/app.log" {
+		t.Fatalf("descriptor = %+v", d)
+	}
+	if d.Name != "" {
+		t.Fatalf("Name = %q, want empty backend default", d.Name)
+	}
+	if got := d.DisplayName(); got != "log /var/log/app.log" {
+		t.Fatalf("DisplayName() = %q, want backend target", got)
 	}
 }
 
@@ -65,7 +117,7 @@ func TestLogSkipsExistingContentByDefault(t *testing.T) {
 
 func TestLogNewContentAfterInit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "app.log")
-	if err := os.WriteFile(path, []byte("old line\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(strings.Repeat("old line\n", 20)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -199,6 +251,133 @@ func TestLogDetailTruncatesLongLines(t *testing.T) {
 	}
 	if !strings.HasSuffix(result.Detail, "...") {
 		t.Fatalf("Detail = %q, want truncated with ...", result.Detail)
+	}
+}
+
+func TestLogMatchesLineLongerThanScannerDefault(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	long := strings.Repeat("x", 70*1024) + " ready\n"
+	if err := os.WriteFile(path, []byte(long), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c := NewLog(path)
+	c.Contains = "ready"
+	c.FromStart = true
+	result := c.Check(t.Context())
+	if result.Status != CheckSatisfied {
+		t.Fatalf("Status = %s, want satisfied for long line; err = %v", result.Status, result.Err)
+	}
+}
+
+func TestLogReportsScannerError(t *testing.T) {
+	c := NewLog("unused")
+	result, complete := c.scanLines(t.Context(), []byte(strings.Repeat("x", int(maxLogScanBytes)+1)))
+	if result.Status == CheckSatisfied {
+		t.Fatal("oversized log token should not be satisfied")
+	}
+	if complete {
+		t.Fatal("oversized log token should not be marked as completely scanned")
+	}
+	if result.Err == nil {
+		t.Fatal("oversized log token should report scanner error")
+	}
+	if !strings.Contains(result.Detail, "log scan failed") {
+		t.Fatalf("Detail = %q, want log scan failure", result.Detail)
+	}
+}
+
+func TestLogDoesNotAdvanceOffsetWhenScanCancelled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	if err := os.WriteFile(path, []byte("service: ready\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c := NewLog(path)
+	c.Contains = "ready"
+	c.FromStart = true
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk, err := c.readNewContent(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	result, complete := c.scanLines(ctx, chunk.data)
+	if complete {
+		t.Fatal("cancelled scan should not be complete")
+	}
+	if result.Err == nil {
+		t.Fatal("cancelled scan should return context error")
+	}
+	if c.offset != 0 {
+		t.Fatalf("offset = %d, want 0 after cancelled scan", c.offset)
+	}
+	if retry := c.Check(t.Context()); retry.Status != CheckSatisfied {
+		t.Fatalf("retry Status = %s, want satisfied after rereading uncommitted bytes", retry.Status)
+	}
+}
+
+func TestLogDoesNotCommitMatchesOnScannerError(t *testing.T) {
+	c := NewLog("unused")
+	c.Contains = "ok"
+	c.MinMatches = 2
+	data := []byte("ok\n" + strings.Repeat("x", int(maxLogScanBytes)+1))
+
+	result, complete := c.scanLines(t.Context(), data)
+	if complete {
+		t.Fatal("scanner error should not be complete")
+	}
+	if result.Err == nil {
+		t.Fatal("scanner error should be returned")
+	}
+	if c.matchCount != 0 {
+		t.Fatalf("matchCount = %d, want 0 after incomplete scan", c.matchCount)
+	}
+}
+
+func TestLogScansFileCreatedAfterWaitStarted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	c := NewLog(path)
+	c.Contains = "ready"
+
+	first := c.Check(t.Context())
+	if first.Status == CheckSatisfied {
+		t.Fatal("missing log file should not satisfy")
+	}
+	if err := os.WriteFile(path, []byte("service ready\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result := c.Check(t.Context())
+	if result.Status != CheckSatisfied {
+		t.Fatalf("Status = %s, want satisfied for file created after wait began; err = %v detail = %q", result.Status, result.Err, result.Detail)
+	}
+}
+
+func TestLogDetectsCopytruncateRotation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	if err := os.WriteFile(path, []byte(strings.Repeat("old line\n", 20)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c := NewLog(path)
+	c.Contains = "ready"
+	if result := c.Check(t.Context()); result.Status == CheckSatisfied {
+		t.Fatal("initial existing content should not satisfy by default")
+	}
+	if err := os.WriteFile(path, []byte("ready after truncate\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result := c.Check(t.Context())
+	if result.Status != CheckSatisfied {
+		t.Fatalf("Status = %s, want satisfied after copytruncate; err = %v detail = %q", result.Status, result.Err, result.Detail)
 	}
 }
 

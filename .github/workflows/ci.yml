@@ -135,6 +135,25 @@ jobs:
           version: latest
           args: --enable=gosec ./...
 
+  complexity:
+    name: Cyclomatic complexity
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install gocyclo
+        run: go install github.com/fzipp/gocyclo/cmd/gocyclo@latest
+
+      - name: Run gocyclo
+        run: make cyclo
+
   coverage:
     name: Coverage report
     runs-on: ubuntu-latest
@@ -174,6 +193,7 @@ jobs:
       - kubernetes-integration
       - lint
       - security
+      - complexity
       - coverage
     strategy:
       matrix:

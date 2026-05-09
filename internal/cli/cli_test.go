@@ -330,6 +330,17 @@ func TestExecuteGuardConditionFatal(t *testing.T) {
 	}
 }
 
+func TestExecuteGuardOnlyInvalidDoesNotPrintProgress(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{"guard", "file", filepath.Join(t.TempDir(), "missing"), "--exists"}, nil, &stdout, &stderr)
+	if code != ExitInvalid {
+		t.Fatalf("exit code = %d, want %d, stdout = %q, stderr = %q", code, ExitInvalid, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stderr.String(), "[waitfor] checking") {
+		t.Fatalf("stderr = %q, want validation error before progress starts", stderr.String())
+	}
+}
+
 func TestExecuteStableSuccesses(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ready")
 	if err := os.WriteFile(path, []byte("ok"), 0o600); err != nil {
@@ -386,12 +397,14 @@ func TestExecuteExecCwdEnvAndOutputLimit(t *testing.T) {
 	dir := t.TempDir()
 	var stdout, stderr bytes.Buffer
 	code := Execute(t.Context(), []string{
+		"--timeout", "100ms",
+		"--interval", "5ms",
 		"exec",
 		"--cwd", dir,
 		"--env", "WAITFOR_TEST=yes",
-		"--max-output-bytes", fmt.Sprint(len(dir) + len(":yes")),
+		"--max-output-bytes", fmt.Sprint(len(":yes")),
 		"--output-contains", ":yes",
-		"--", "/bin/sh", "-c", "printf '%s:%s:long-output' \"$PWD\" \"$WAITFOR_TEST\"",
+		"--", "/bin/sh", "-c", "test -d \"$PWD\" && test \"$WAITFOR_TEST\" = yes && printf ':yes:long-output'",
 	}, nil, &stdout, &stderr)
 	if code != ExitSatisfied {
 		t.Fatalf("exit code = %d, want %d, stdout = %q, stderr = %q", code, ExitSatisfied, stdout.String(), stderr.String())
@@ -442,6 +455,16 @@ func TestExecuteInvalidHTTPURLDoesNotEchoSensitiveInput(t *testing.T) {
 	}
 }
 
+func TestParseHTTPConditionRejectsInvalidJSONPath(t *testing.T) {
+	_, err := parseHTTPCondition([]string{"http", "http://example.com", "--jsonpath", "ready == true"})
+	if err == nil {
+		t.Fatal("parseHTTPCondition() expected invalid jsonpath error, got nil")
+	}
+	if !strings.Contains(err.Error(), "jsonpath must start") {
+		t.Fatalf("err = %q, want jsonpath error", err)
+	}
+}
+
 func TestSplitConditionSegments(t *testing.T) {
 	tests := []struct {
 		name string
@@ -459,6 +482,8 @@ func TestSplitConditionSegments(t *testing.T) {
 		{name: "literal guard in exec command", args: []string{"exec", "--", "/bin/echo", "--", "guard"}, want: 1},
 		{name: "dns literal separator value before guard", args: []string{"dns", "example.com", "--contains", "--", "--", "guard", "log", "app.log", "--contains", "panic"}, want: 2},
 		{name: "dns equals literal separator value before guard", args: []string{"dns", "example.com", "--equals", "--", "--", "guard", "log", "app.log", "--contains", "panic"}, want: 2},
+		{name: "log tail value before backend token", args: []string{"log", "app.log", "--contains", "ready", "--tail", "http", "--", "file", "README.md"}, want: 2},
+		{name: "log min matches value before backend token", args: []string{"log", "app.log", "--contains", "ready", "--min-matches", "http", "--", "file", "README.md"}, want: 2},
 	}
 
 	for _, tt := range tests {
@@ -474,6 +499,50 @@ func TestSplitConditionSegments(t *testing.T) {
 	}
 }
 
+func TestConditionValueFlagsCoversBackendValueFlags(t *testing.T) {
+	valueFlags := []string{
+		"--method",
+		"--status",
+		"--header",
+		"--body",
+		"--body-file",
+		"--body-contains",
+		"--body-matches",
+		"--jsonpath",
+		"--type",
+		"--resolver",
+		"--contains",
+		"--matches",
+		"--exclude",
+		"--tail",
+		"--min-matches",
+		"--equals",
+		"--min-count",
+		"--absent-mode",
+		"--server",
+		"--rcode",
+		"--transport",
+		"--udp-size",
+		"--health",
+		"--namespace",
+		"--condition",
+		"--for",
+		"--selector",
+		"--kubeconfig",
+		"--exit-code",
+		"--output-contains",
+		"--cwd",
+		"--env",
+		"--max-output-bytes",
+		"--name",
+	}
+	for _, flag := range valueFlags {
+		if !conditionValueFlags[flag] {
+			t.Fatalf("conditionValueFlags[%q] = false, want true", flag)
+		}
+	}
+}
+
 func TestParseFileConditionFlags(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -486,6 +555,7 @@ func TestParseFileConditionFlags(t *testing.T) {
 		{name: "deleted", args: []string{"file", "/tmp/f", "--deleted"}, wantState: condition.FileDeleted},
 		{name: "nonempty", args: []string{"file", "/tmp/f", "--nonempty"}, wantState: condition.FileNonEmpty},
 		{name: "mutual exclusion", args: []string{"file", "/tmp/f", "--exists", "--deleted"}, wantErr: "mutually exclusive"},
+		{name: "deleted contains", args: []string{"file", "/tmp/f", "--deleted", "--contains", "gone"}, wantErr: "--deleted cannot be combined"},
 		{name: "extra positional", args: []string{"file", "/tmp/f", "exists"}, wantErr: "exactly one PATH"},
 	}
 	for _, tt := range tests {
@@ -508,6 +578,16 @@ func TestParseFileConditionFlags(t *testing.T) {
 				t.Fatalf("State = %q, want %q", fc.State, tt.wantState)
 			}
 		})
+	}
+}
+
+func TestParseExecConditionRejectsInvalidJSONPath(t *testing.T) {
+	_, err := parseExecCondition([]string{"exec", "--jsonpath", "ready == true", "--", "/bin/sh", "-c", "printf '{}'"})
+	if err == nil {
+		t.Fatal("parseExecCondition() expected invalid jsonpath error, got nil")
+	}
+	if !strings.Contains(err.Error(), "jsonpath must start") {
+		t.Fatalf("err = %q, want jsonpath error", err)
 	}
 }
 
@@ -593,6 +673,8 @@ func TestParseGlobalErrors(t *testing.T) {
 		{"bad backoff", []string{"--backoff", "linear", "file", "x"}, "invalid backoff"},
 		{"max interval below interval", []string{"--interval", "10ms", "--max-interval", "1ms", "file", "x"}, "max-interval"},
 		{"negative jitter", []string{"--jitter", "-1%", "file", "x"}, "jitter"},
+		{"nan jitter", []string{"--jitter", "NaN", "file", "x"}, "jitter"},
+		{"infinite jitter", []string{"--jitter", "+Inf", "file", "x"}, "jitter"},
 		{"bad jitter", []string{"--jitter", "sometimes", "file", "x"}, "invalid jitter"},
 	}
 	for _, tt := range tests {
@@ -661,6 +743,53 @@ func TestDoctorStatusCombination(t *testing.T) {
 	}
 }
 
+func TestRunDoctorWithRequiredInjectedFailure(t *testing.T) {
+	deps := doctorDeps{checks: []doctorCheckFunc{
+		func(context.Context) doctorCheck {
+			return doctorCheck{Name: "temp", Status: doctorOK, Detail: "ok"}
+		},
+		func(context.Context) doctorCheck {
+			return doctorCheck{Name: "docker", Status: doctorWarn, Detail: "offline"}
+		},
+	}}
+	var stdout, stderr bytes.Buffer
+	code, err := runDoctorWithDeps(t.Context(), []string{"--output", "json", "--require", "docker"}, &stdout, &stderr, deps)
+	if err != nil {
+		t.Fatalf("runDoctorWithDeps() error = %v", err)
+	}
+	if code != ExitFatal {
+		t.Fatalf("exit code = %d, want %d", code, ExitFatal)
+	}
+	var report doctorReport
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatalf("invalid json: %v: %s", err, stdout.String())
+	}
+	if report.Status != doctorFail {
+		t.Fatalf("status = %s, want fail", report.Status)
+	}
+	if len(report.Checks) != 2 || !report.Checks[1].Required {
+		t.Fatalf("checks = %+v, want injected required docker check", report.Checks)
+	}
+}
+
+func TestBuildDoctorReportUsesCallerContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	deps := doctorDeps{checks: []doctorCheckFunc{
+		func(ctx context.Context) doctorCheck {
+			if ctx.Err() == nil {
+				t.Fatal("doctor check received uncancelled context")
+			}
+			return doctorCheck{Name: "temp", Status: doctorOK}
+		},
+	}}
+
+	report := buildDoctorReport(ctx, map[string]bool{"temp": true}, deps)
+	if report.Status != doctorOK {
+		t.Fatalf("status = %s, want ok", report.Status)
+	}
+}
+
 func TestDoctorTextHelpers(t *testing.T) {
 	report := doctorReport{
 		Status:  doctorWarn,
@@ -686,7 +815,7 @@ func TestDoctorTextHelpers(t *testing.T) {
 }
 
 func TestRunDoctorCommandError(t *testing.T) {
-	_, err := runDoctorCommand("definitely-no-such-waitfor-doctor-command")
+	_, err := runDoctorCommand(t.Context(), "definitely-no-such-waitfor-doctor-command")
 	if err == nil {
 		t.Fatal("runDoctorCommand() expected error, got nil")
 	}
@@ -777,6 +906,16 @@ func TestValidateEnvVarsDoesNotEchoSensitiveInput(t *testing.T) {
 	}
 }
 
+func TestParseLogConditionRejectsInvalidJSONPath(t *testing.T) {
+	_, err := parseLogCondition([]string{"log", filepath.Join(t.TempDir(), "app.log"), "--jsonpath", "ready == true"})
+	if err == nil {
+		t.Fatal("parseLogCondition() expected invalid jsonpath error, got nil")
+	}
+	if !strings.Contains(err.Error(), "jsonpath must start") {
+		t.Fatalf("err = %q, want jsonpath error", err)
+	}
+}
+
 // ── parseKubernetesCondition ──────────────────────────────────────────────────
 
 func TestParseKubernetesConditionSuccess(t *testing.T) {
@@ -834,6 +973,7 @@ func TestParseKubernetesConditionErrors(t *testing.T) {
 		{"complete wrong kind", []string{"k8s", "pod/a", "--for", "complete"}, "not supported"},
 		{"rollout wrong kind", []string{"k8s", "job/a", "--for", "rollout"}, "not supported"},
 		{"bad jsonpath", []string{"k8s", "pod/a", "--jsonpath", "  "}, "required"},
+		{"bad jsonpath path", []string{"k8s", "pod/a", "--jsonpath", "ready == true"}, "jsonpath must start"},
 		{"unknown flag", []string{"k8s", "pod/a", "--no-such-flag"}, ""},
 	}
 	for _, tt := range tests {
@@ -905,6 +1045,8 @@ func TestParseDNSConditionErrors(t *testing.T) {
 		{"bad type", []string{"dns", "example.com", "--type", "BOGUS"}, "invalid dns record type"},
 		{"mx requires wire", []string{"dns", "example.com", "--type", "MX"}, "requires --resolver wire"},
 		{"bad resolver", []string{"dns", "example.com", "--resolver", "raw"}, "invalid dns resolver"},
+		{"bad host whitespace", []string{"dns", "bad name"}, "invalid dns name"},
+		{"bad host control", []string{"dns", "bad\tname"}, "invalid dns name"},
 		{"bad min count", []string{"dns", "example.com", "--min-count", "-1"}, "min-count cannot be negative"},
 		{"absent conflict", []string{"dns", "example.com", "--absent", "--contains", "ready"}, "--absent cannot be combined"},
 		{"bad absent mode", []string{"dns", "example.com", "--absent-mode", "gone"}, "invalid dns absent-mode"},
@@ -915,6 +1057,9 @@ func TestParseDNSConditionErrors(t *testing.T) {
 		{"bad udp size", []string{"dns", "example.com", "--resolver", "wire", "--server", "1.1.1.1", "--udp-size", "70000"}, "udp-size"},
 		{"wire missing server", []string{"dns", "example.com", "--resolver", "wire"}, "--resolver wire requires --server"},
 		{"bad server", []string{"dns", "example.com", "--server", "host:"}, "invalid dns server address"},
+		{"empty bracket server", []string{"dns", "example.com", "--server", "[]"}, "invalid dns server address"},
+		{"space server", []string{"dns", "example.com", "--server", "bad host"}, "invalid dns server address"},
+		{"bad server port", []string{"dns", "example.com", "--server", "host:abc"}, "port must be between 1 and 65535"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -929,7 +1074,7 @@ func TestParseDNSConditionErrors(t *testing.T) {
 	}
 }
 
-func TestParseDNSServer(t *testing.T) {
+func TestNormalizeDNSServerFromCLI(t *testing.T) {
 	tests := []struct {
 		input string
 		want  string
@@ -943,12 +1088,34 @@ func TestParseDNSServer(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			got, err := parseDNSServer(tt.input)
+			got, err := condition.NormalizeDNSServer(tt.input)
 			if err != nil {
-				t.Fatalf("parseDNSServer(%q) error = %v", tt.input, err)
+				t.Fatalf("NormalizeDNSServer(%q) error = %v", tt.input, err)
 			}
 			if got != tt.want {
-				t.Fatalf("parseDNSServer(%q) = %q, want %q", tt.input, got, tt.want)
+				t.Fatalf("NormalizeDNSServer(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeDNSServerErrorsFromCLI(t *testing.T) {
+	tests := []string{
+		"host:",
+		"host:abc",
+		"host:0",
+		"host:70000",
+		"[::1]:abc",
+		"[]",
+		"bad host",
+		"::1 bad",
+		" host",
+		" ",
+	}
+	for _, input := range tests {
+		t.Run(input, func(t *testing.T) {
+			if _, err := condition.NormalizeDNSServer(input); err == nil {
+				t.Fatalf("NormalizeDNSServer(%q) expected error, got nil", input)
 			}
 		})
 	}
@@ -1032,6 +1199,26 @@ func TestSplitHeaderNoSeparator(t *testing.T) {
 	_, _, ok := splitHeader("plain-value-no-separator")
 	if ok {
 		t.Fatal("splitHeader without separator should return ok=false")
+	}
+}
+
+func TestParseHTTPHeadersRejectsInvalidInput(t *testing.T) {
+	tests := []string{
+		"Bad Header: value",
+		"X-Test: ok\nbad",
+		"X-Test: bad\x01",
+	}
+
+	for _, raw := range tests {
+		t.Run(raw, func(t *testing.T) {
+			_, err := parseHTTPHeaders([]string{raw})
+			if err == nil {
+				t.Fatal("parseHTTPHeaders() expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), "invalid HTTP header") {
+				t.Fatalf("err = %q, want invalid HTTP header error", err)
+			}
+		})
 	}
 }
 

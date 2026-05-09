@@ -311,7 +311,10 @@ and Kubernetes resources.
 ## Docker Image
 
 The image is built from Docker Hardened Images: `dhi.io/golang:1.26-dev` for
-compilation and `dhi.io/static:20250419` for the distroless runtime.
+compilation and `dhi.io/static:20250419` for the distroless runtime. The DHI
+builder image intentionally follows the maintained Go 1.26 dev tag, while
+CI and release builds pin the exact Go patch version declared in `go.mod` and
+the GitHub workflows.
 
 Local image builds require access to DHI:
 

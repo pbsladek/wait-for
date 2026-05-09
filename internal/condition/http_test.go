@@ -89,6 +89,46 @@ func TestHTTPConditionNoRedirects(t *testing.T) {
 	}
 }
 
+func TestHTTPConditionInvalidDirectConfigFatalBeforeRequest(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*HTTPCondition)
+	}{
+		{"empty url", func(c *HTTPCondition) { c.URL = "" }},
+		{"unsupported scheme", func(c *HTTPCondition) { c.URL = "ftp://example.test/file" }},
+		{"missing host", func(c *HTTPCondition) { c.URL = "https:///ready" }},
+		{"invalid method", func(c *HTTPCondition) { c.Method = "BAD METHOD" }},
+		{"invalid expected status", func(c *HTTPCondition) { c.ExpectedStatus = 99 }},
+		{"invalid matcher raw", func(c *HTTPCondition) { c.StatusMatcher = HTTPStatusMatcher{raw: "9xx"} }},
+		{"invalid matcher exact", func(c *HTTPCondition) { c.StatusMatcher = HTTPStatusMatcher{exact: 99} }},
+		{"invalid matcher class", func(c *HTTPCondition) { c.StatusMatcher = HTTPStatusMatcher{class: 9} }},
+		{"ambiguous status matcher", func(c *HTTPCondition) {
+			c.StatusMatcher = HTTPStatusMatcher{exact: http.StatusOK, class: 2}
+		}},
+		{"expected status with matcher", func(c *HTTPCondition) {
+			c.ExpectedStatus = http.StatusOK
+			c.StatusMatcher = HTTPStatusMatcher{class: 2}
+		}},
+		{"invalid header name", func(c *HTTPCondition) { c.Headers["Bad Header"] = "ok" }},
+		{"invalid header value", func(c *HTTPCondition) { c.Headers["X-Test"] = "bad\nvalue" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cond := NewHTTP("https://example.test/ready")
+			cond.Client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				t.Fatal("request should not be sent for invalid config")
+				return nil, nil
+			})}
+			tt.setup(cond)
+
+			result := cond.Check(t.Context())
+			if result.Status != CheckFatal {
+				t.Fatalf("status = %s, want fatal", result.Status)
+			}
+		})
+	}
+}
+
 func TestParseHTTPStatusMatcher(t *testing.T) {
 	tests := []struct {
 		raw  string

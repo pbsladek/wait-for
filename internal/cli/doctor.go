@@ -47,11 +47,21 @@ type doctorOptions struct {
 	required map[string]bool
 }
 
+type doctorCheckFunc func(context.Context) doctorCheck
+
+type doctorDeps struct {
+	checks []doctorCheckFunc
+}
+
 func isDoctorCommand(args []string) bool {
 	return len(args) > 0 && args[0] == "doctor"
 }
 
-func runDoctor(args []string, stdout io.Writer, _ io.Writer) (int, error) {
+func runDoctor(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) (int, error) {
+	return runDoctorWithDeps(ctx, args, stdout, stderr, defaultDoctorDeps())
+}
+
+func runDoctorWithDeps(ctx context.Context, args []string, stdout io.Writer, _ io.Writer, deps doctorDeps) (int, error) {
 	if doctorWantsHelp(args) {
 		_, _ = io.WriteString(stdout, doctorHelpText())
 		return ExitSatisfied, nil
@@ -60,7 +70,7 @@ func runDoctor(args []string, stdout io.Writer, _ io.Writer) (int, error) {
 	if err != nil {
 		return ExitInvalid, err
 	}
-	report := buildDoctorReport(opts.required)
+	report := buildDoctorReport(ctx, opts.required, deps)
 	if err := writeDoctorReport(stdout, opts.format, report); err != nil {
 		return ExitFatal, err
 	}
@@ -68,6 +78,16 @@ func runDoctor(args []string, stdout io.Writer, _ io.Writer) (int, error) {
 		return ExitFatal, nil
 	}
 	return ExitSatisfied, nil
+}
+
+func defaultDoctorDeps() doctorDeps {
+	return doctorDeps{checks: []doctorCheckFunc{
+		tempDirCheck,
+		shellCheck,
+		dockerCheck,
+		kubernetesCheck,
+		dnsWireCheck,
+	}}
 }
 
 func doctorWantsHelp(args []string) bool {
@@ -125,7 +145,7 @@ func validDoctorCheck(name string) bool {
 	}
 }
 
-func buildDoctorReport(required map[string]bool) doctorReport {
+func buildDoctorReport(ctx context.Context, required map[string]bool, deps doctorDeps) doctorReport {
 	version, commit := buildMetadata()
 	report := doctorReport{
 		Status:  doctorOK,
@@ -133,13 +153,9 @@ func buildDoctorReport(required map[string]bool) doctorReport {
 		Commit:  commit,
 		GOOS:    runtime.GOOS,
 		GOARCH:  runtime.GOARCH,
-		Checks: []doctorCheck{
-			tempDirCheck(),
-			shellCheck(),
-			dockerCheck(),
-			kubernetesCheck(),
-			dnsWireCheck(),
-		},
+	}
+	for _, check := range deps.checks {
+		report.Checks = append(report.Checks, check(ctx))
 	}
 	for i := range report.Checks {
 		report.Checks[i].Required = required[report.Checks[i].Name]
@@ -173,7 +189,7 @@ func buildMetadata() (string, string) {
 	return version, commit
 }
 
-func tempDirCheck() doctorCheck {
+func tempDirCheck(_ context.Context) doctorCheck {
 	dir := os.TempDir()
 	file, err := os.CreateTemp(dir, "waitfor-doctor-*")
 	if err != nil {
@@ -189,7 +205,7 @@ func tempDirCheck() doctorCheck {
 	return doctorCheck{Name: "temp", Status: doctorOK, Detail: "writable " + filepath.Clean(dir)}
 }
 
-func shellCheck() doctorCheck {
+func shellCheck(_ context.Context) doctorCheck {
 	shell := os.Getenv("SHELL")
 	if shell == "" {
 		shell = "sh"
@@ -201,34 +217,34 @@ func shellCheck() doctorCheck {
 	return doctorCheck{Name: "shell", Status: doctorOK, Detail: path}
 }
 
-func dockerCheck() doctorCheck {
+func dockerCheck(ctx context.Context) doctorCheck {
 	if _, err := exec.LookPath("docker"); err != nil {
 		return doctorCheck{Name: "docker", Status: doctorWarn, Detail: "docker CLI not found"}
 	}
-	out, err := runDoctorCommand("docker", "version", "--format", "{{.Server.Version}}")
+	out, err := runDoctorCommand(ctx, "docker", "version", "--format", "{{.Server.Version}}")
 	if err != nil {
 		return doctorCheck{Name: "docker", Status: doctorWarn, Detail: err.Error()}
 	}
 	return doctorCheck{Name: "docker", Status: doctorOK, Detail: "server " + out}
 }
 
-func kubernetesCheck() doctorCheck {
+func kubernetesCheck(ctx context.Context) doctorCheck {
 	if _, err := exec.LookPath("kubectl"); err != nil {
 		return doctorCheck{Name: "k8s", Status: doctorWarn, Detail: "kubectl not found"}
 	}
-	out, err := runDoctorCommand("kubectl", "config", "current-context")
+	out, err := runDoctorCommand(ctx, "kubectl", "config", "current-context")
 	if err != nil {
 		return doctorCheck{Name: "k8s", Status: doctorWarn, Detail: err.Error()}
 	}
 	return doctorCheck{Name: "k8s", Status: doctorOK, Detail: "context " + out}
 }
 
-func dnsWireCheck() doctorCheck {
+func dnsWireCheck(_ context.Context) doctorCheck {
 	return doctorCheck{Name: "dns-wire", Status: doctorOK, Detail: "compiled"}
 }
 
-func runDoctorCommand(name string, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+func runDoctorCommand(ctx context.Context, name string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...) // #nosec G204 -- doctor runs fixed diagnostics, not user-supplied commands.
 	var stdout, stderr bytes.Buffer
