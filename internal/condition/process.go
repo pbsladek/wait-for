@@ -117,9 +117,10 @@ func checkProcessFound(found bool, want ProcessState, detail string) Result {
 }
 
 func countNamedProcesses(processes []ProcessInfo, name string) int {
+	want := filepath.Base(strings.TrimSpace(name))
 	count := 0
 	for _, process := range processes {
-		if processNameMatches(process, name) {
+		if processNameMatches(process, want) {
 			count++
 		}
 	}
@@ -127,21 +128,29 @@ func countNamedProcesses(processes []ProcessInfo, name string) int {
 }
 
 func processNameMatches(process ProcessInfo, want string) bool {
-	want = filepath.Base(strings.TrimSpace(want))
-	for _, value := range []string{process.Name, process.Command} {
-		if filepath.Base(firstCommandToken(value)) == want {
-			return true
-		}
+	if filepath.Base(firstCommandToken(process.Name)) == want {
+		return true
 	}
-	return false
+	return filepath.Base(firstCommandToken(process.Command)) == want
 }
 
 func firstCommandToken(command string) string {
-	fields := strings.Fields(command)
-	if len(fields) == 0 {
-		return ""
+	command = strings.TrimSpace(command)
+	for i := 0; i < len(command); i++ {
+		if isProcessTokenSpace(command[i]) {
+			return command[:i]
+		}
 	}
-	return fields[0]
+	return command
+}
+
+func isProcessTokenSpace(ch byte) bool {
+	switch ch {
+	case ' ', '\t', '\n', '\r', '\f', '\v':
+		return true
+	default:
+		return false
+	}
 }
 
 func processTarget(c *ProcessCondition) string {
@@ -160,12 +169,14 @@ func processNameDetail(name string, count int) string {
 }
 
 func defaultProcessList(ctx context.Context) ([]ProcessInfo, error) {
-	cmd := exec.CommandContext(ctx, "ps", "-axo", "pid=,comm=,args=")
-	out, err := cmd.Output()
+	out, err := runLimitedCommand(ctx, "ps", "-axo", "pid=,comm=,args=")
 	if err != nil {
 		return nil, classifyProcessListError(err, ctx.Err())
 	}
-	return parseProcessTable(string(out)), nil
+	if out.truncated {
+		return nil, fmt.Errorf("process list output exceeded %d bytes", maxExternalCommandOutputBytes)
+	}
+	return parseProcessTable(string(out.stdout)), nil
 }
 
 func classifyProcessListError(err, ctxErr error) error {

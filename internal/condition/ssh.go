@@ -44,6 +44,8 @@ func (c *SSHCondition) Check(ctx context.Context) Result {
 		return Unsatisfied("", err)
 	}
 	defer func() { _ = conn.Close() }()
+	stopCancelWatcher := closeOnContextDone(ctx, conn)
+	defer stopCancelWatcher()
 	applySSHDeadline(ctx, conn)
 	if c.authMode() {
 		return c.checkAuth(conn)
@@ -60,6 +62,9 @@ func validateSSHConfig(c *SSHCondition) error {
 	}
 	if (c.User == "") != (c.Password == "") {
 		return fmt.Errorf("ssh --user and --password must be provided together")
+	}
+	if c.User != "" && c.HostKeySHA256 == "" {
+		return fmt.Errorf("ssh password auth requires --host-key-sha256")
 	}
 	if c.HostKeySHA256 != "" && !validSSHHostKeySHA256(c.HostKeySHA256) {
 		return fmt.Errorf("invalid ssh host key SHA256 fingerprint")
@@ -116,11 +121,26 @@ func readSSHBanner(ctx context.Context, conn net.Conn) (string, error) {
 			return "", fmt.Errorf("read ssh banner: %w", err)
 		}
 		line = strings.TrimRight(line, "\r\n")
-		if strings.HasPrefix(line, "SSH-") {
+		if validSSHBanner(line) {
 			return line, nil
 		}
 	}
 	return "", fmt.Errorf("ssh banner not found")
+}
+
+func validSSHBanner(line string) bool {
+	if len(line) > maxSSHBannerBytes {
+		return false
+	}
+	if !strings.HasPrefix(line, "SSH-2.0-") && !strings.HasPrefix(line, "SSH-1.99-") {
+		return false
+	}
+	for i := 0; i < len(line); i++ {
+		if line[i] < 0x20 || line[i] > 0x7e {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *SSHCondition) checkAuth(conn net.Conn) Result {
@@ -141,7 +161,9 @@ func (c *SSHCondition) checkAuth(conn net.Conn) Result {
 
 func (c *SSHCondition) hostKeyCallback() ssh.HostKeyCallback {
 	if c.HostKeySHA256 == "" {
-		return ssh.InsecureIgnoreHostKey() // #nosec G106 -- readiness probe can opt into host key pinning with --host-key-sha256.
+		return func(_ string, _ net.Addr, _ ssh.PublicKey) error {
+			return fmt.Errorf("ssh host key fingerprint is required")
+		}
 	}
 	want := normalizeSSHHostKeySHA256(c.HostKeySHA256)
 	return func(_ string, _ net.Addr, key ssh.PublicKey) error {

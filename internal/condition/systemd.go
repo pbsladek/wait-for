@@ -66,6 +66,9 @@ func validateSystemdConfig(c *SystemdCondition) error {
 	if strings.TrimSpace(c.Unit) == "" {
 		return fmt.Errorf("systemd unit is required")
 	}
+	if err := rejectOptionLike("systemd unit", c.Unit); err != nil {
+		return err
+	}
 	switch c.State {
 	case SystemdActive, SystemdInactive, SystemdFailed:
 		return nil
@@ -75,6 +78,9 @@ func validateSystemdConfig(c *SystemdCondition) error {
 }
 
 func checkSystemdState(state SystemdUnitState, want SystemdState) Result {
+	if strings.EqualFold(state.LoadState, "not-found") {
+		return Unsatisfied("unit not found", fmt.Errorf("systemd unit not found"))
+	}
 	active := strings.ToLower(state.ActiveState)
 	if active == string(want) {
 		return Satisfied(systemdDetail(state))
@@ -84,12 +90,11 @@ func checkSystemdState(state SystemdUnitState, want SystemdState) Result {
 }
 
 func defaultSystemdShow(ctx context.Context, unit string) (SystemdUnitState, error) {
-	cmd := exec.CommandContext(ctx, "systemctl", "show", unit, "--property=LoadState,ActiveState,SubState")
-	out, err := cmd.CombinedOutput()
+	out, err := runLimitedCommand(ctx, "systemctl", "show", unit, "--property=LoadState,ActiveState,SubState")
 	if err != nil {
-		return SystemdUnitState{}, classifySystemdCommandError(err, string(out), ctx.Err())
+		return SystemdUnitState{}, classifySystemdCommandError(err, string(out.combined(maxExternalCommandOutputBytes)), ctx.Err())
 	}
-	return parseSystemdShow(string(out)), nil
+	return parseSystemdShow(string(out.stdout)), nil
 }
 
 func classifySystemdCommandError(err error, output string, ctxErr error) error {

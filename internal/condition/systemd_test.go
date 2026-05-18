@@ -67,6 +67,19 @@ func TestSystemdConditionStateUnsatisfied(t *testing.T) {
 	}
 }
 
+func TestSystemdConditionInactiveMissingUnitUnsatisfied(t *testing.T) {
+	cond := NewSystemd("missing.service")
+	cond.State = SystemdInactive
+	cond.Show = func(context.Context, string) (SystemdUnitState, error) {
+		return SystemdUnitState{LoadState: "not-found", ActiveState: "inactive"}, nil
+	}
+
+	result := cond.Check(t.Context())
+	if result.Status != CheckUnsatisfied {
+		t.Fatalf("status = %s, want unsatisfied", result.Status)
+	}
+}
+
 func TestSystemdConditionMissingSystemctlFatal(t *testing.T) {
 	cond := NewSystemd("nginx.service")
 	cond.Show = func(context.Context, string) (SystemdUnitState, error) {
@@ -111,6 +124,7 @@ func TestSystemdConditionInvalidConfigFatal(t *testing.T) {
 		setup func(*SystemdCondition)
 	}{
 		{"missing unit", func(c *SystemdCondition) { c.Unit = "" }},
+		{"option-like unit", func(c *SystemdCondition) { c.Unit = "--help" }},
 		{"bad state", func(c *SystemdCondition) { c.State = "warm" }},
 	}
 	for _, tt := range tests {
@@ -161,7 +175,11 @@ func TestDefaultSystemdShowUsesSystemctlOutput(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "systemctl")
 	script := "#!/bin/sh\nprintf 'LoadState=loaded\\nActiveState=active\\nSubState=running\\n'\n"
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// #nosec G302 -- test helper creates a private executable under t.TempDir().
+	if err := os.Chmod(path, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)

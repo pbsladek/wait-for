@@ -120,6 +120,32 @@ func TestGlobMalformedPatternFatal(t *testing.T) {
 	}
 }
 
+func TestBoundedGlobBranches(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ready.done")
+	writeGlobFile(t, dir, "ready.done")
+	matches, err := boundedGlob(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 || matches[0] != path {
+		t.Fatalf("matches = %v, want exact path", matches)
+	}
+	if matches, err := boundedGlob(t.Context(), filepath.Join(dir, "missing.done")); err != nil || len(matches) != 0 {
+		t.Fatalf("missing matches=%v err=%v, want none", matches, err)
+	}
+	if _, err := boundedGlob(t.Context(), filepath.Join(dir, "*", "*.done")); err == nil {
+		t.Fatal("directory wildcard succeeded")
+	}
+	names := make([]string, maxGlobMatches+1)
+	for i := range names {
+		names[i] = fmt.Sprintf("%d.done", i)
+	}
+	if _, err := appendGlobMatches(nil, dir, "*.done", names); err == nil {
+		t.Fatal("too many glob matches succeeded")
+	}
+}
+
 func TestGlobContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()

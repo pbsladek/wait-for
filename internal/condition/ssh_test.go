@@ -109,6 +109,7 @@ func TestSSHInvalidDirectConfigFatal(t *testing.T) {
 		{"empty address", func(c *SSHCondition) { c.Address = "" }},
 		{"bad address", func(c *SSHCondition) { c.Address = "example.test" }},
 		{"partial auth", func(c *SSHCondition) { c.User = "deploy" }},
+		{"auth without host key", func(c *SSHCondition) { c.User = "deploy"; c.Password = "secret" }},
 		{"bad fingerprint", func(c *SSHCondition) { c.HostKeySHA256 = "not-base64" }},
 	}
 	for _, tt := range tests {

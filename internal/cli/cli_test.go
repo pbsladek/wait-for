@@ -719,6 +719,7 @@ func TestParseSSHConditionErrors(t *testing.T) {
 		{name: "bad address", segment: []string{"ssh", "example.test"}, wantErr: "invalid ssh address"},
 		{name: "partial auth user", segment: []string{"ssh", "example.test:22", "--user", "deploy"}, wantErr: "provided together"},
 		{name: "partial auth password", segment: []string{"ssh", "example.test:22", "--password", "secret"}, wantErr: "provided together"},
+		{name: "auth without host key", segment: []string{"ssh", "example.test:22", "--user", "deploy", "--password", "secret"}, wantErr: "host-key-sha256"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -736,7 +737,7 @@ func TestParseS3ConditionFlags(t *testing.T) {
 		"--exists",
 		"--metadata", "version=42",
 		"--contains", `"ready":true`,
-		"--endpoint-url", "http://127.0.0.1:9000",
+		"--endpoint-url", "https://127.0.0.1:9000",
 		"--region", "auto",
 		"--virtual-hosted-style",
 		"--access-key-id", "test-access-key",
@@ -750,7 +751,7 @@ func TestParseS3ConditionFlags(t *testing.T) {
 	if !ok {
 		t.Fatalf("condition type = %T, want *condition.S3Condition", cond)
 	}
-	if s3Cond.URL != "s3://ready-bucket/path/ready.json" || s3Cond.EndpointURL != "http://127.0.0.1:9000" {
+	if s3Cond.URL != "s3://ready-bucket/path/ready.json" || s3Cond.EndpointURL != "https://127.0.0.1:9000" {
 		t.Fatalf("s3 condition = %+v", s3Cond)
 	}
 	if !s3Cond.VirtualHostedStyle || s3Cond.Region != "auto" {
@@ -778,6 +779,8 @@ func TestParseS3ConditionErrors(t *testing.T) {
 		{name: "metadata without key", segment: []string{"s3", "s3://bucket", "--metadata", "version=1"}, wantErr: "object key"},
 		{name: "bad metadata", segment: []string{"s3", "s3://bucket/key", "--metadata", "version"}, wantErr: "Key=Value"},
 		{name: "bad endpoint", segment: []string{"s3", "s3://bucket/key", "--endpoint-url", "ftp://example.test"}, wantErr: "http or https"},
+		{name: "endpoint userinfo", segment: []string{"s3", "s3://bucket/key", "--endpoint-url", "https://user@example.test"}, wantErr: "userinfo"},
+		{name: "plaintext credentials", segment: []string{"s3", "s3://bucket/key", "--endpoint-url", "http://127.0.0.1:9000", "--access-key-id", "id", "--secret-access-key", "secret"}, wantErr: "https"},
 		{name: "blank region", segment: []string{"s3", "s3://bucket/key", "--region", " "}, wantErr: "region"},
 	}
 	for _, tt := range tests {
@@ -1201,6 +1204,15 @@ func TestRunDoctorCommandError(t *testing.T) {
 	_, err := runDoctorCommand(t.Context(), "definitely-no-such-waitfor-doctor-command")
 	if err == nil {
 		t.Fatal("runDoctorCommand() expected error, got nil")
+	}
+}
+
+func TestDoctorLimitedBufferTruncates(t *testing.T) {
+	var buf doctorLimitedBuffer
+	_, _ = buf.Write([]byte(strings.Repeat("x", maxDoctorCommandOutput+1)))
+	got := buf.String()
+	if !strings.Contains(got, "truncated") {
+		t.Fatalf("buffer suffix = %q, want truncation marker", got[len(got)-32:])
 	}
 }
 
@@ -1640,20 +1652,25 @@ func TestSplitHeaderNoSeparator(t *testing.T) {
 }
 
 func TestParseHTTPHeadersRejectsInvalidInput(t *testing.T) {
-	tests := []string{
-		"Bad Header: value",
-		"X-Test: ok\nbad",
-		"X-Test: bad\x01",
+	tests := []struct {
+		name  string
+		input []string
+		want  string
+	}{
+		{name: "bad name", input: []string{"Bad Header: value"}, want: "invalid HTTP header"},
+		{name: "newline", input: []string{"X-Test: ok\nbad"}, want: "invalid HTTP header"},
+		{name: "control", input: []string{"X-Test: bad\x01"}, want: "invalid HTTP header"},
+		{name: "duplicate", input: []string{"X-Test=one", "x-test=two"}, want: "duplicate HTTP header"},
 	}
 
-	for _, raw := range tests {
-		t.Run(raw, func(t *testing.T) {
-			_, err := parseHTTPHeaders([]string{raw})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseHTTPHeaders(tt.input)
 			if err == nil {
 				t.Fatal("parseHTTPHeaders() expected error, got nil")
 			}
-			if !strings.Contains(err.Error(), "invalid HTTP header") {
-				t.Fatalf("err = %q, want invalid HTTP header error", err)
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("err = %q, want %q", err, tt.want)
 			}
 		})
 	}

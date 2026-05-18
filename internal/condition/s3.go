@@ -89,14 +89,8 @@ func validateS3Config(c *S3Condition) (S3Target, error) {
 	if err != nil {
 		return S3Target{}, err
 	}
-	if c.Contains != "" && target.Key == "" {
-		return S3Target{}, fmt.Errorf("s3 content checks require an object key")
-	}
-	if len(c.Metadata) > 0 && target.Key == "" {
-		return S3Target{}, fmt.Errorf("s3 metadata checks require an object key")
-	}
-	if strings.TrimSpace(c.region()) == "" {
-		return S3Target{}, fmt.Errorf("s3 region is required")
+	if err := validateS3ObjectChecks(c, target); err != nil {
+		return S3Target{}, err
 	}
 	if err := validateS3Endpoint(c.EndpointURL); err != nil {
 		return S3Target{}, err
@@ -104,7 +98,23 @@ func validateS3Config(c *S3Condition) (S3Target, error) {
 	if err := validateS3Credentials(c.Credentials); err != nil {
 		return S3Target{}, err
 	}
+	if err := validateS3CredentialTransport(c.EndpointURL, c.Credentials); err != nil {
+		return S3Target{}, err
+	}
 	return target, nil
+}
+
+func validateS3ObjectChecks(c *S3Condition, target S3Target) error {
+	if c.Contains != "" && target.Key == "" {
+		return fmt.Errorf("s3 content checks require an object key")
+	}
+	if len(c.Metadata) > 0 && target.Key == "" {
+		return fmt.Errorf("s3 metadata checks require an object key")
+	}
+	if strings.TrimSpace(c.region()) == "" {
+		return fmt.Errorf("s3 region is required")
+	}
+	return nil
 }
 
 func ParseS3URL(raw string) (S3Target, error) {
@@ -131,14 +141,38 @@ func validateS3Endpoint(raw string) error {
 		return nil
 	}
 	parsed, err := url.Parse(raw)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+	if err != nil {
+		return fmt.Errorf("invalid s3 endpoint URL")
+	}
+	return validateParsedS3Endpoint(parsed)
+}
+
+func validateParsedS3Endpoint(parsed *url.URL) error {
+	if parsed.Scheme == "" || parsed.Host == "" {
 		return fmt.Errorf("invalid s3 endpoint URL")
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return fmt.Errorf("s3 endpoint URL must use http or https")
 	}
+	if parsed.User != nil {
+		return fmt.Errorf("s3 endpoint URL cannot include userinfo")
+	}
 	if parsed.RawQuery != "" || parsed.Fragment != "" {
 		return fmt.Errorf("s3 endpoint URL cannot include query or fragment")
+	}
+	return nil
+}
+
+func validateS3CredentialTransport(endpoint string, creds S3Credentials) error {
+	if endpoint == "" || creds.AccessKeyID == "" {
+		return nil
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return err
+	}
+	if parsed.Scheme == "http" {
+		return fmt.Errorf("s3 credentials require an https endpoint")
 	}
 	return nil
 }
@@ -199,23 +233,36 @@ func (c *S3Condition) awsS3URL(target S3Target) string {
 }
 
 func joinS3Path(base string, parts ...string) string {
-	segments := make([]string, 0, 1+len(parts))
-	for _, segment := range strings.Split(strings.Trim(base, "/"), "/") {
-		if segment != "" {
-			segments = append(segments, segment)
-		}
+	path := "/" + strings.Trim(base, "/")
+	if path == "/" {
+		path = ""
 	}
-	for _, part := range parts {
-		for _, segment := range strings.Split(strings.Trim(part, "/"), "/") {
-			if segment != "" {
-				segments = append(segments, segment)
-			}
+	for i, part := range parts {
+		if part == "" {
+			continue
 		}
+		if i == len(parts)-1 {
+			path = appendS3ObjectKey(path, part)
+			continue
+		}
+		path = appendS3PathSegment(path, part)
 	}
-	if len(segments) == 0 {
+	if path == "" {
 		return "/"
 	}
-	return "/" + strings.Join(segments, "/")
+	return path
+}
+
+func appendS3PathSegment(path, segment string) string {
+	segment = strings.Trim(segment, "/")
+	if segment == "" {
+		return path
+	}
+	return strings.TrimRight(path, "/") + "/" + segment
+}
+
+func appendS3ObjectKey(path, key string) string {
+	return strings.TrimRight(path, "/") + "/" + key
 }
 
 func (c *S3Condition) httpClient() *http.Client {
@@ -256,7 +303,7 @@ func (c *S3Condition) checkS3Metadata(headers http.Header) *Result {
 		header := s3MetadataHeader(key)
 		if got := headers.Get(header); got != want {
 			detail := fmt.Sprintf("metadata %s mismatch", key)
-			r := Unsatisfied(detail, fmt.Errorf("metadata %s = %q, expected %q", key, got, want))
+			r := Unsatisfied(detail, errors.New(detail))
 			return &r
 		}
 	}
@@ -275,9 +322,12 @@ func checkS3Content(ctx context.Context, body io.Reader, contains string) Result
 		return Unsatisfied("", ctx.Err())
 	default:
 	}
-	data, err := io.ReadAll(io.LimitReader(body, maxS3ContentBytes))
+	data, err := io.ReadAll(io.LimitReader(body, maxS3ContentBytes+1))
 	if err != nil {
 		return Unsatisfied("", err)
+	}
+	if int64(len(data)) > maxS3ContentBytes {
+		return Unsatisfied("object content too large", fmt.Errorf("object content exceeds %d bytes", maxS3ContentBytes))
 	}
 	if !bytes.Contains(data, []byte(contains)) {
 		return Unsatisfied("object content marker not found", fmt.Errorf("object does not contain required marker"))

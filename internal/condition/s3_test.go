@@ -117,6 +117,29 @@ func TestS3RequestURLEscapesObjectKey(t *testing.T) {
 	}
 }
 
+func TestS3RequestURLPreservesOpaqueObjectKey(t *testing.T) {
+	cond := NewS3("s3://ready-bucket")
+	cond.EndpointURL = "https://objects.example.test/root"
+
+	got, err := cond.s3RequestURL(S3Target{Bucket: "ready-bucket", Key: "a//b/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "https://objects.example.test/root/ready-bucket/a//b/"
+	if got != want {
+		t.Fatalf("s3RequestURL() = %q, want %q", got, want)
+	}
+
+	got, err = cond.s3RequestURL(S3Target{Bucket: "ready-bucket", Key: "/ready"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = "https://objects.example.test/root/ready-bucket//ready"
+	if got != want {
+		t.Fatalf("s3RequestURL() = %q, want %q", got, want)
+	}
+}
+
 func TestS3CephRGWEndpointWithBasePath(t *testing.T) {
 	cond := NewS3("s3://ready-bucket/path/ready.json")
 	cond.EndpointURL = "https://ceph-rgw.example.test/s3"
@@ -183,8 +206,8 @@ func TestS3MetadataMismatch(t *testing.T) {
 	if result.Status != CheckUnsatisfied {
 		t.Fatalf("status = %s, want unsatisfied", result.Status)
 	}
-	if result.Err == nil || !strings.Contains(result.Err.Error(), "expected") {
-		t.Fatalf("err = %v, want metadata mismatch", result.Err)
+	if result.Err == nil || strings.Contains(result.Err.Error(), "41") || strings.Contains(result.Err.Error(), "42") {
+		t.Fatalf("err = %v, want redacted metadata mismatch", result.Err)
 	}
 }
 
@@ -210,7 +233,7 @@ func TestS3ContentMissing(t *testing.T) {
 func TestS3SignsRequestsWhenCredentialsProvided(t *testing.T) {
 	var authorization string
 	var token string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authorization = r.Header.Get("Authorization")
 		token = r.Header.Get("X-Amz-Security-Token")
 		w.WriteHeader(http.StatusOK)
@@ -219,6 +242,7 @@ func TestS3SignsRequestsWhenCredentialsProvided(t *testing.T) {
 
 	cond := NewS3("s3://ready-bucket/path/ready.json")
 	cond.EndpointURL = server.URL
+	cond.Client = server.Client()
 	cond.Region = "auto"
 	cond.Now = func() time.Time { return time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC) }
 	cond.Credentials = S3Credentials{
@@ -247,9 +271,14 @@ func TestS3InvalidDirectConfigFatal(t *testing.T) {
 		{"bad url", func(c *S3Condition) { c.URL = "https://example.test/object" }},
 		{"blank region", func(c *S3Condition) { c.Region = " " }},
 		{"bad endpoint", func(c *S3Condition) { c.EndpointURL = "ftp://example.test" }},
+		{"endpoint userinfo", func(c *S3Condition) { c.EndpointURL = "https://user@example.test" }},
 		{"contains without key", func(c *S3Condition) { c.URL = "s3://bucket"; c.Contains = "ready" }},
 		{"metadata without key", func(c *S3Condition) { c.URL = "s3://bucket"; c.Metadata = map[string]string{"version": "1"} }},
 		{"partial credentials", func(c *S3Condition) { c.Credentials.AccessKeyID = "AKIATest" }},
+		{"plaintext credentials", func(c *S3Condition) {
+			c.EndpointURL = "http://127.0.0.1:9000"
+			c.Credentials = S3Credentials{AccessKeyID: "AKIATest", SecretAccessKey: "secret"}
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -274,6 +303,13 @@ func TestParseS3URL(t *testing.T) {
 	}
 	if target.Bucket != "bucket" || target.Key != "path/ready file.json" {
 		t.Fatalf("target = %+v", target)
+	}
+	target, err = ParseS3URL("s3://bucket/%2Fready")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.Key != "/ready" {
+		t.Fatalf("key = %q, want leading slash preserved", target.Key)
 	}
 }
 

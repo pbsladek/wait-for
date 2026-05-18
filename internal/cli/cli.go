@@ -334,22 +334,33 @@ func parseConditions(args []string) ([]condition.Condition, error) {
 type backendParser func([]string) (condition.Condition, error)
 
 var backendParsers = map[string]backendParser{
-	"http":    parseHTTPCondition,
-	"tcp":     parseTCPCondition,
-	"unix":    parseUnixCondition,
-	"tls":     parseTLSCondition,
-	"ssh":     parseSSHCondition,
-	"s3":      parseS3Condition,
-	"glob":    parseGlobCondition,
-	"ports":   parsePortsCondition,
-	"exec":    parseExecCondition,
-	"file":    parseFileCondition,
-	"log":     parseLogCondition,
-	"k8s":     parseKubernetesCondition,
-	"dns":     parseDNSCondition,
-	"docker":  parseDockerCondition,
-	"process": parseProcessCondition,
-	"systemd": parseSystemdCondition,
+	"http":       parseHTTPCondition,
+	"tcp":        parseTCPCondition,
+	"unix":       parseUnixCondition,
+	"tls":        parseTLSCondition,
+	"ssh":        parseSSHCondition,
+	"s3":         parseS3Condition,
+	"glob":       parseGlobCondition,
+	"ports":      parsePortsCondition,
+	"exec":       parseExecCondition,
+	"file":       parseFileCondition,
+	"log":        parseLogCondition,
+	"k8s":        parseKubernetesCondition,
+	"dns":        parseDNSCondition,
+	"docker":     parseDockerCondition,
+	"process":    parseProcessCondition,
+	"systemd":    parseSystemdCondition,
+	"launchd":    parseLaunchdCondition,
+	"pidfile":    parsePIDFileCondition,
+	"lockfile":   parseLockfileCondition,
+	"permission": parsePermissionCondition,
+	"checksum":   parseChecksumCondition,
+	"archive":    parseArchiveCondition,
+	"cosign":     parseCosignCondition,
+	"ntp":        parseNTPCondition,
+	"icmp":       parseICMPCondition,
+	"grpc":       parseGRPCCondition,
+	"websocket":  parseWebSocketCondition,
 }
 
 func parseCondition(segment []string) (condition.Condition, error) {
@@ -477,6 +488,7 @@ func parseBodyContent(body, bodyFile string) ([]byte, error) {
 
 func parseHTTPHeaders(rawHeaders []string) (map[string]string, error) {
 	headers := make(map[string]string, len(rawHeaders))
+	seen := make(map[string]bool, len(rawHeaders))
 	for _, raw := range rawHeaders {
 		key, value, ok := splitHeader(raw)
 		if !ok {
@@ -488,6 +500,11 @@ func parseHTTPHeaders(rawHeaders []string) (map[string]string, error) {
 		if !validHTTPHeaderValue(value) {
 			return nil, fmt.Errorf("invalid HTTP header value for %q", key)
 		}
+		canonical := strings.ToLower(key)
+		if seen[canonical] {
+			return nil, fmt.Errorf("duplicate HTTP header %q", key)
+		}
+		seen[canonical] = true
 		headers[key] = value
 	}
 	return headers, nil
@@ -684,7 +701,8 @@ func parseTLSValidFor(raw string) (time.Duration, error) {
 	}
 	if strings.HasSuffix(raw, "d") {
 		days, err := strconv.ParseInt(strings.TrimSuffix(raw, "d"), 10, 64)
-		if err != nil || days < 0 {
+		maxDays := int64(math.MaxInt64) / int64(24*time.Hour)
+		if err != nil || days < 0 || days > maxDays {
 			return 0, fmt.Errorf("invalid --valid-for duration %q", raw)
 		}
 		return time.Duration(days) * 24 * time.Hour, nil
@@ -738,6 +756,9 @@ func parseSSHCondition(segment []string) (condition.Condition, error) {
 	if (user == "") != (password == "") {
 		return nil, fmt.Errorf("--user and --password must be provided together")
 	}
+	if user != "" && hostKeySHA256 == "" {
+		return nil, fmt.Errorf("--host-key-sha256 is required with password auth")
+	}
 	cond := condition.NewSSH(args[0])
 	cond.BannerContains = bannerContains
 	cond.User = user
@@ -782,7 +803,12 @@ func parseS3Condition(segment []string) (condition.Condition, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := validateS3CLIOptions(target, endpointURL, region, contains, metadata); err != nil {
+	creds := condition.S3Credentials{
+		AccessKeyID:     accessKeyID,
+		SecretAccessKey: secretAccessKey,
+		SessionToken:    sessionToken,
+	}
+	if err := validateS3CLIOptions(target, endpointURL, region, contains, metadata, creds); err != nil {
 		return nil, err
 	}
 	cond := condition.NewS3(args[0])
@@ -791,15 +817,21 @@ func parseS3Condition(segment []string) (condition.Condition, error) {
 	cond.VirtualHostedStyle = virtualHostedStyle
 	cond.Metadata = metadata
 	cond.Contains = contains
-	cond.Credentials = condition.S3Credentials{
-		AccessKeyID:     accessKeyID,
-		SecretAccessKey: secretAccessKey,
-		SessionToken:    sessionToken,
-	}
+	cond.Credentials = creds
 	return cond, nil
 }
 
-func validateS3CLIOptions(target condition.S3Target, endpointURL, region, contains string, metadata map[string]string) error {
+func validateS3CLIOptions(target condition.S3Target, endpointURL, region, contains string, metadata map[string]string, creds condition.S3Credentials) error {
+	if err := validateS3CLITargetOptions(target, region, contains, metadata); err != nil {
+		return err
+	}
+	if err := validateS3EndpointURL(endpointURL); err != nil {
+		return err
+	}
+	return validateS3CLICredentialTransport(endpointURL, creds)
+}
+
+func validateS3CLITargetOptions(target condition.S3Target, region, contains string, metadata map[string]string) error {
 	if contains != "" && target.Key == "" {
 		return fmt.Errorf("--contains requires an object key")
 	}
@@ -809,7 +841,18 @@ func validateS3CLIOptions(target condition.S3Target, endpointURL, region, contai
 	if strings.TrimSpace(region) == "" {
 		return fmt.Errorf("--region cannot be empty")
 	}
-	return validateS3EndpointURL(endpointURL)
+	return nil
+}
+
+func validateS3CLICredentialTransport(endpointURL string, creds condition.S3Credentials) error {
+	if endpointURL == "" || creds.AccessKeyID == "" {
+		return nil
+	}
+	parsed, _ := url.Parse(endpointURL)
+	if parsed.Scheme == "http" {
+		return fmt.Errorf("s3 credentials require an https endpoint")
+	}
+	return nil
 }
 
 func validateS3EndpointURL(endpointURL string) error {
@@ -817,11 +860,21 @@ func validateS3EndpointURL(endpointURL string) error {
 		return nil
 	}
 	parsed, err := url.Parse(endpointURL)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+	if err != nil {
+		return fmt.Errorf("invalid s3 endpoint URL")
+	}
+	return validateParsedS3EndpointURL(parsed)
+}
+
+func validateParsedS3EndpointURL(parsed *url.URL) error {
+	if parsed.Scheme == "" || parsed.Host == "" {
 		return fmt.Errorf("invalid s3 endpoint URL")
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return fmt.Errorf("s3 endpoint URL must use http or https")
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("s3 endpoint URL cannot include userinfo")
 	}
 	if parsed.RawQuery != "" || parsed.Fragment != "" {
 		return fmt.Errorf("s3 endpoint URL cannot include query or fragment")
@@ -1288,6 +1341,387 @@ func parseSystemdState(active, inactive, failed bool) (condition.SystemdState, e
 	default:
 		return condition.SystemdActive, nil
 	}
+}
+
+func parseLaunchdCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("launchd", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	loaded := false
+	running := false
+	fs.BoolVar(&loaded, "loaded", loaded, "wait until the service is loaded")
+	fs.BoolVar(&running, "running", running, "wait until the service is running")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 1 {
+		return nil, fmt.Errorf("launchd requires exactly one LABEL")
+	}
+	state, err := parseLaunchdState(loaded, running)
+	if err != nil {
+		return nil, err
+	}
+	cond := condition.NewLaunchd(fs.Args()[0])
+	cond.State = state
+	return cond, nil
+}
+
+func parseLaunchdState(loaded, running bool) (condition.LaunchdState, error) {
+	if loaded && running {
+		return "", fmt.Errorf("--loaded and --running are mutually exclusive")
+	}
+	if loaded {
+		return condition.LaunchdLoaded, nil
+	}
+	return condition.LaunchdRunning, nil
+}
+
+func parsePIDFileCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("pidfile", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	running := false
+	stopped := false
+	fs.BoolVar(&running, "running", running, "wait until the pidfile points to a running process")
+	fs.BoolVar(&stopped, "stopped", stopped, "wait until the pidfile is absent or stale")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 1 {
+		return nil, fmt.Errorf("pidfile requires exactly one PATH")
+	}
+	state, err := parseProcessState(running, stopped)
+	if err != nil {
+		return nil, err
+	}
+	cond := condition.NewPIDFile(fs.Args()[0])
+	cond.State = state
+	return cond, nil
+}
+
+func parseLockfileCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("lockfile", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	present := false
+	absent := false
+	olderThanText := ""
+	fs.BoolVar(&present, "present", present, "wait until the lockfile exists")
+	fs.BoolVar(&absent, "absent", absent, "wait until the lockfile is absent")
+	fs.StringVar(&olderThanText, "older-than", olderThanText, "wait until the lockfile exists and is at least this old")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 1 {
+		return nil, fmt.Errorf("lockfile requires exactly one PATH")
+	}
+	state, err := parseLockfileState(present || olderThanText != "", absent)
+	if err != nil {
+		return nil, err
+	}
+	cond := condition.NewLockfile(fs.Args()[0])
+	cond.State = state
+	if olderThanText != "" {
+		olderThan, err := time.ParseDuration(olderThanText)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --older-than: %w", err)
+		}
+		cond.OlderThan = olderThan
+	}
+	return cond, nil
+}
+
+func parseLockfileState(present, absent bool) (condition.LockfileState, error) {
+	if present && absent {
+		return "", fmt.Errorf("--present and --absent are mutually exclusive")
+	}
+	if present {
+		return condition.LockfilePresent, nil
+	}
+	return condition.LockfileAbsent, nil
+}
+
+func parsePermissionCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("permission", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	modeText := ""
+	uid := -1
+	gid := -1
+	userName := ""
+	groupName := ""
+	typeText := string(condition.PermissionAny)
+	fs.StringVar(&modeText, "mode", modeText, "required permission mode, such as 0644")
+	fs.IntVar(&uid, "uid", uid, "required numeric owner uid")
+	fs.IntVar(&gid, "gid", gid, "required numeric group gid")
+	fs.StringVar(&userName, "user", userName, "required owner user name")
+	fs.StringVar(&groupName, "group", groupName, "required group name")
+	fs.StringVar(&typeText, "type", typeText, "required path type: any, file, dir, or symlink")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 1 {
+		return nil, fmt.Errorf("permission requires exactly one PATH")
+	}
+	cond := condition.NewPermission(fs.Args()[0])
+	if err := applyPermissionOptions(cond, modeText, uid, gid, userName, groupName, typeText); err != nil {
+		return nil, err
+	}
+	return cond, nil
+}
+
+func applyPermissionOptions(cond *condition.PermissionCondition, modeText string, uid, gid int, userName, groupName, typeText string) error {
+	if modeText != "" {
+		mode, err := strconv.ParseUint(modeText, 8, 32)
+		if err != nil {
+			return fmt.Errorf("invalid --mode %q: %w", modeText, err)
+		}
+		cond.Mode = os.FileMode(mode)
+	}
+	cond.Type = condition.PermissionPathType(strings.ToLower(typeText))
+	if err := applyOwnerOption(cond, uid, userName); err != nil {
+		return err
+	}
+	return applyGroupOption(cond, gid, groupName)
+}
+
+func applyOwnerOption(cond *condition.PermissionCondition, uid int, userName string) error {
+	if uid >= 0 && userName != "" {
+		return fmt.Errorf("--uid and --user are mutually exclusive")
+	}
+	if uid >= 0 {
+		cond.UID = &uid
+		return nil
+	}
+	if userName == "" {
+		return nil
+	}
+	parsed, err := strconv.Atoi(userName)
+	if err != nil {
+		return fmt.Errorf("--user must be a numeric uid")
+	}
+	cond.UID = &parsed
+	return nil
+}
+
+func applyGroupOption(cond *condition.PermissionCondition, gid int, groupName string) error {
+	if gid >= 0 && groupName != "" {
+		return fmt.Errorf("--gid and --group are mutually exclusive")
+	}
+	if gid >= 0 {
+		cond.GID = &gid
+		return nil
+	}
+	if groupName == "" {
+		return nil
+	}
+	parsed, err := strconv.Atoi(groupName)
+	if err != nil {
+		return fmt.Errorf("--group must be a numeric gid")
+	}
+	cond.GID = &parsed
+	return nil
+}
+
+func parseChecksumCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("checksum", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	algorithm := string(condition.ChecksumAuto)
+	expected := ""
+	fs.StringVar(&algorithm, "algorithm", algorithm, "hash algorithm: auto, sha1, sha256, or sha512")
+	fs.StringVar(&expected, "equals", expected, "expected hex checksum, optionally prefixed with algorithm:")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 1 {
+		return nil, fmt.Errorf("checksum requires exactly one PATH")
+	}
+	cond := condition.NewChecksum(fs.Args()[0])
+	cond.Algorithm = condition.ChecksumAlgorithm(strings.ToLower(algorithm))
+	cond.Expected = expected
+	return cond, nil
+}
+
+func parseArchiveCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("archive", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	member := ""
+	matches := ""
+	format := string(condition.ArchiveAuto)
+	fs.StringVar(&member, "contains", member, "required member path inside the archive")
+	fs.StringVar(&matches, "matches", matches, "required archive member glob")
+	fs.StringVar(&format, "format", format, "archive format: auto, tar, tgz, or zip")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 1 {
+		return nil, fmt.Errorf("archive requires exactly one PATH")
+	}
+	cond := condition.NewArchive(fs.Args()[0])
+	cond.Member = member
+	cond.Matches = matches
+	cond.Format = condition.ArchiveFormat(strings.ToLower(format))
+	return cond, nil
+}
+
+func parseCosignCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("cosign", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	blob := false
+	key := ""
+	signature := ""
+	certificate := ""
+	identity := ""
+	oidcIssuer := ""
+	fs.BoolVar(&blob, "blob", blob, "verify an artifact blob with cosign verify-blob")
+	fs.StringVar(&key, "key", key, "public key path or URI")
+	fs.StringVar(&signature, "signature", signature, "signature path for --blob")
+	fs.StringVar(&certificate, "certificate", certificate, "certificate path for keyless verification")
+	fs.StringVar(&identity, "certificate-identity", identity, "expected certificate identity for keyless verification")
+	fs.StringVar(&oidcIssuer, "certificate-oidc-issuer", oidcIssuer, "expected OIDC issuer for keyless verification")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 1 {
+		return nil, fmt.Errorf("cosign requires exactly one TARGET")
+	}
+	cond := condition.NewCosign(fs.Args()[0])
+	cond.Key = key
+	cond.Signature = signature
+	cond.Certificate = certificate
+	cond.Identity = identity
+	cond.OIDCIssuer = oidcIssuer
+	if blob {
+		cond.Mode = condition.CosignBlob
+	}
+	return cond, nil
+}
+
+func parseNTPCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("ntp", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	maxOffsetText := ""
+	timeoutText := ""
+	fs.StringVar(&maxOffsetText, "max-offset", maxOffsetText, "maximum absolute clock offset, such as 250ms")
+	fs.StringVar(&timeoutText, "timeout", timeoutText, "per-attempt NTP query timeout")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 1 {
+		return nil, fmt.Errorf("ntp requires exactly one HOST[:PORT]")
+	}
+	cond := condition.NewNTP(fs.Args()[0])
+	if maxOffsetText != "" {
+		maxOffset, err := time.ParseDuration(maxOffsetText)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --max-offset: %w", err)
+		}
+		cond.MaxOffset = maxOffset
+	}
+	if timeoutText != "" {
+		timeout, err := time.ParseDuration(timeoutText)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --timeout: %w", err)
+		}
+		cond.AttemptTimeout = timeout
+	}
+	return cond, nil
+}
+
+func parseICMPCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("icmp", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	count := 1
+	timeoutText := ""
+	fs.IntVar(&count, "count", count, "number of echo requests to send")
+	fs.StringVar(&timeoutText, "timeout", timeoutText, "per-attempt ping timeout")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 1 {
+		return nil, fmt.Errorf("icmp requires exactly one HOST")
+	}
+	cond := condition.NewICMP(fs.Args()[0])
+	cond.Count = count
+	if timeoutText != "" {
+		timeout, err := time.ParseDuration(timeoutText)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --timeout: %w", err)
+		}
+		cond.AttemptTimeout = timeout
+	}
+	return cond, nil
+}
+
+func parseGRPCCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("grpc", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	service := ""
+	status := string(condition.GRPCStatusServing)
+	useTLS := false
+	timeoutText := ""
+	fs.StringVar(&service, "service", service, "gRPC health service name")
+	fs.StringVar(&status, "status", status, "expected health status: SERVING, NOT_SERVING, UNKNOWN, or SERVICE_UNKNOWN")
+	fs.BoolVar(&useTLS, "tls", useTLS, "use TLS for host:port addresses")
+	fs.StringVar(&timeoutText, "timeout", timeoutText, "per-attempt gRPC health check timeout")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 1 {
+		return nil, fmt.Errorf("grpc requires exactly one ADDRESS")
+	}
+	cond := condition.NewGRPC(fs.Args()[0])
+	cond.Service = service
+	cond.Status = condition.GRPCServingStatus(strings.ToUpper(status))
+	cond.UseTLS = useTLS
+	if timeoutText != "" {
+		timeout, err := time.ParseDuration(timeoutText)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --timeout: %w", err)
+		}
+		cond.AttemptTimeout = timeout
+	}
+	return cond, nil
+}
+
+func parseWebSocketCondition(segment []string) (condition.Condition, error) {
+	fs := pflag.NewFlagSet("websocket", pflag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	send := ""
+	contains := ""
+	matches := ""
+	timeoutText := ""
+	headers := []string{}
+	fs.StringVar(&send, "send", send, "text message to send after connecting")
+	fs.StringVar(&contains, "contains", contains, "required text message substring")
+	fs.StringVar(&matches, "matches", matches, "required text message regex")
+	fs.StringVar(&timeoutText, "timeout", timeoutText, "per-attempt WebSocket timeout")
+	fs.StringArrayVar(&headers, "header", headers, "extra HTTP header, as Key: Value or Key=Value")
+	if err := fs.Parse(segment[1:]); err != nil {
+		return nil, err
+	}
+	if len(fs.Args()) != 1 {
+		return nil, fmt.Errorf("websocket requires exactly one URL")
+	}
+	cond := condition.NewWebSocket(fs.Args()[0])
+	cond.Send = send
+	cond.Contains = contains
+	if matches != "" {
+		re, err := regexp.Compile(matches)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --matches regex: %w", err)
+		}
+		cond.Matches = re
+	}
+	parsedHeaders, err := parseHTTPHeaders(headers)
+	if err != nil {
+		return nil, err
+	}
+	cond.Headers = parsedHeaders
+	if timeoutText != "" {
+		timeout, err := time.ParseDuration(timeoutText)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --timeout: %w", err)
+		}
+		cond.AttemptTimeout = timeout
+	}
+	return cond, nil
 }
 
 func validDockerStatus(status string) bool {
@@ -1866,18 +2300,14 @@ func indexOf(items []string, want string) int {
 }
 
 func readFileLimit(path string, limit int64) ([]byte, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("file must be a regular file")
-	}
-	file, err := os.Open(path) // #nosec G304 -- body-file is an explicit user-selected CLI input.
+	file, info, err := openRegularFile(path)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = file.Close() }()
+	if info.Size() > limit {
+		return nil, fmt.Errorf("file exceeds %d bytes", limit)
+	}
 
 	data, err := io.ReadAll(io.LimitReader(file, limit+1))
 	if err != nil {
@@ -2007,6 +2437,47 @@ Systemd:
   --inactive               Wait until the unit is inactive
   --failed                 Wait until the unit is failed
 
+Launchd:
+  waitfor launchd LABEL [--running|--loaded]
+  --running                Wait until launchctl reports a non-zero pid (default)
+  --loaded                 Wait until launchctl can print the service
+
+PID file:
+  waitfor pidfile PATH [--running|--stopped]
+  --running                Wait until the pidfile points to a live process (default)
+  --stopped                Wait until the pidfile is absent or stale
+
+Lockfile:
+  waitfor lockfile PATH [--absent|--present] [--older-than DURATION]
+  --absent                 Wait until the lockfile is absent (default)
+  --present                Wait until the lockfile exists
+  --older-than duration    Wait until the lockfile exists and is at least this old
+
+Permission:
+  waitfor permission PATH [--mode 0644] [--uid UID|--user UID] [--gid GID|--group GID] [--type any|file|dir|symlink]
+
+Checksum:
+  waitfor checksum PATH --equals [ALGORITHM:]HEX [--algorithm auto|sha256|sha512|sha1]
+
+Archive:
+  waitfor archive PATH (--contains MEMBER | --matches GLOB) [--format auto|tar|tgz|zip]
+
+Cosign:
+  waitfor cosign IMAGE [--key KEY] [--certificate CERT] [--certificate-identity ID] [--certificate-oidc-issuer URL]
+  waitfor cosign --blob FILE --signature SIG [--key KEY] [--certificate CERT]
+
+NTP:
+  waitfor ntp HOST[:PORT] [--max-offset DURATION] [--timeout DURATION]
+
+ICMP:
+  waitfor icmp HOST [--count N] [--timeout DURATION]
+
+gRPC:
+  waitfor grpc ADDRESS [--service NAME] [--status SERVING|NOT_SERVING|UNKNOWN|SERVICE_UNKNOWN] [--tls] [--timeout DURATION]
+
+WebSocket:
+  waitfor websocket ws://HOST/PATH [--send TEXT] [--contains TEXT|--matches REGEX] [--header Key=Value] [--timeout DURATION]
+
 Exec:
   waitfor exec [flags] -- COMMAND [ARGS...]
   --exit-code 0            Expected exit code (default: 0)
@@ -2058,7 +2529,7 @@ Examples:
   waitfor ports localhost --range 8000-8010 --any
   waitfor tls api.example.com:443 --valid-for 30d
   waitfor ssh host.example.com:22
-  waitfor ssh host.example.com:22 --user deploy --password "$SSH_PASSWORD"
+  waitfor ssh host.example.com:22 --user deploy --password "$SSH_PASSWORD" --host-key-sha256 SHA256:...
   waitfor s3 s3://bucket/path/ready.json --exists
   waitfor s3 s3://bucket/path/ready.json --contains '"ready":true' --endpoint-url http://localhost:9000
   waitfor s3 s3://bucket/path/ready.json --endpoint-url https://ceph-rgw.example.com --region default
@@ -2066,6 +2537,17 @@ Examples:
   waitfor docker postgres --health healthy
   waitfor process --name postgres --running
   waitfor systemd nginx.service --active
+  waitfor launchd system/com.example.agent --running
+  waitfor pidfile /var/run/app.pid --running
+  waitfor lockfile /var/run/app.lock --older-than 5m
+  waitfor permission /var/run/app.conf --mode 0640 --gid 1000 --type file
+  waitfor checksum dist/app.tar.gz --equals "sha256:$SHA256"
+  waitfor archive dist/app.tar.gz --matches 'bin/*'
+  waitfor cosign ghcr.io/org/app:v1.2.3 --certificate-identity "$IDENTITY"
+  waitfor ntp time.cloudflare.com --max-offset 250ms --timeout 1s
+  waitfor icmp 192.0.2.10 --count 3 --timeout 1s
+  waitfor grpc localhost:50051 --service grpc.health.v1.Health --tls --timeout 2s
+  waitfor websocket ws://localhost:8080/events --matches 'ready|ok' --header 'Authorization=Bearer ...'
   waitfor file /tmp/ready.flag --exists
   waitfor glob '/tmp/jobs/*.done' --min-count 5
   waitfor log /var/log/app.log --contains "server ready"

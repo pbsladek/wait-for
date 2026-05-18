@@ -1,12 +1,17 @@
 package integration_test
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha1" //nolint:gosec // RFC 6455 requires SHA-1 for Sec-WebSocket-Accept.
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -15,9 +20,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 var waitforBinary string
@@ -205,6 +214,176 @@ func acceptBlackboxUnixConnections(listener net.Listener) {
 	}
 }
 
+func writeBlackboxExecutable(t *testing.T, dir, name, script string) {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// #nosec G302 -- black-box helper creates a private executable under t.TempDir().
+	if err := os.Chmod(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeBlackboxZipArchive(t *testing.T, path, name string) {
+	t.Helper()
+	file, err := os.Create(path) // #nosec G304 -- test helper writes only caller-provided t.TempDir() paths.
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = file.Close() }()
+	writer := zip.NewWriter(file)
+	entry, err := writer.Create(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := entry.Write([]byte("ok")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func newBlackboxNTPServer(t *testing.T, offset time.Duration) string {
+	t.Helper()
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	go func() {
+		buf := make([]byte, 48)
+		n, addr, err := conn.ReadFrom(buf)
+		if err != nil || n < 48 {
+			return
+		}
+		resp := make([]byte, 48)
+		resp[0] = 0x24
+		resp[1] = 1
+		copy(resp[24:32], buf[40:48])
+		writeBlackboxNTPTimestamp(resp[32:40], time.Now().Add(offset))
+		writeBlackboxNTPTimestamp(resp[40:48], time.Now().Add(offset))
+		_, _ = conn.WriteTo(resp, addr)
+	}()
+	return conn.LocalAddr().String()
+}
+
+func writeBlackboxNTPTimestamp(dst []byte, t time.Time) {
+	seconds := clampBlackboxInt64ToUint32(t.Unix() + 2208988800)
+	fraction := uint64(float64(t.Nanosecond()) * (1 << 32) / 1e9)
+	binary.BigEndian.PutUint32(dst[0:4], seconds)
+	binary.BigEndian.PutUint32(dst[4:8], clampBlackboxUint64ToUint32(fraction))
+}
+
+func newBlackboxGRPCHealthServer(t *testing.T, status byte) string {
+	t.Helper()
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/grpc.health.v1.Health/Check" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/grpc")
+		w.Header().Set("Trailer", "Grpc-Status")
+		_, _ = w.Write(blackboxGRPCFrame([]byte{0x08, status}))
+		w.Header().Set("Grpc-Status", "0")
+	})
+	server := httptest.NewServer(h2c.NewHandler(handler, &http2.Server{}))
+	t.Cleanup(server.Close)
+	return "grpc://" + strings.TrimPrefix(server.URL, "http://")
+}
+
+func blackboxGRPCFrame(payload []byte) []byte {
+	frame := make([]byte, 5, len(payload)+5)
+	binary.BigEndian.PutUint32(frame[1:5], uint32(len(payload))) // #nosec G115 -- test payloads are tiny.
+	return append(frame, payload...)
+}
+
+func newBlackboxWebSocketServer(t *testing.T, message string) string {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, rw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		if r.Header.Get("Authorization") != "Bearer token" {
+			t.Errorf("Authorization = %q", r.Header.Get("Authorization"))
+			return
+		}
+		accept := blackboxWebSocketAccept(r.Header.Get("Sec-WebSocket-Key"))
+		_, _ = fmt.Fprintf(rw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", accept)
+		_ = rw.Flush()
+		_, payload, err := readBlackboxWebSocketClientFrame(rw)
+		if err != nil {
+			t.Errorf("client frame: %v", err)
+			return
+		}
+		if string(payload) != "hello" {
+			t.Errorf("payload = %q", payload)
+			return
+		}
+		_, _ = rw.Write(blackboxWebSocketTextFrame(message))
+		_ = rw.Flush()
+	}))
+	t.Cleanup(server.Close)
+	return "ws://" + strings.TrimPrefix(server.URL, "http://")
+}
+
+func blackboxWebSocketAccept(key string) string {
+	sum := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")) // #nosec G401 -- RFC 6455 requires SHA-1.
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
+func blackboxWebSocketTextFrame(message string) []byte {
+	payload := []byte(message)
+	frame := []byte{0x81, byte(len(payload))} // #nosec G115 -- test messages are shorter than 126 bytes.
+	return append(frame, payload...)
+}
+
+func readBlackboxWebSocketClientFrame(r io.Reader) (byte, []byte, error) {
+	var header [2]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return 0, nil, err
+	}
+	if header[1]&0x80 == 0 {
+		return 0, nil, errors.New("client frame was not masked")
+	}
+	length := int(header[1] & 0x7f)
+	var mask [4]byte
+	if _, err := io.ReadFull(r, mask[:]); err != nil {
+		return 0, nil, err
+	}
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return 0, nil, err
+	}
+	for i := range payload {
+		payload[i] ^= mask[i%4]
+	}
+	return header[0] & 0x0f, payload, nil
+}
+
+func clampBlackboxInt64ToUint32(value int64) uint32 {
+	if value <= 0 {
+		return 0
+	}
+	if value > int64(^uint32(0)) {
+		return ^uint32(0)
+	}
+	return uint32(value)
+}
+
+func clampBlackboxUint64ToUint32(value uint64) uint32 {
+	if value > uint64(^uint32(0)) {
+		return ^uint32(0)
+	}
+	return uint32(value)
+}
+
 func TestBinaryFilePolling(t *testing.T) {
 	requireBlackbox(t)
 
@@ -344,6 +523,71 @@ func TestBinaryProcessPIDPolling(t *testing.T) {
 	requireExitCode(t, runWaitfor(t, "process", "--pid", strconv.Itoa(os.Getpid()), "--running"), 0)
 	requireExitCode(t, runWaitfor(t, "--timeout", "75ms", "--interval", "20ms",
 		"process", "--pid", strconv.Itoa(os.Getpid()), "--stopped"), 1)
+}
+
+func TestBinaryExtraLocalBackends(t *testing.T) {
+	requireBlackbox(t)
+
+	dir := t.TempDir()
+	pidfile := filepath.Join(dir, "app.pid")
+	if err := os.WriteFile(pidfile, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	requireExitCode(t, runWaitfor(t, "pidfile", pidfile, "--running"), 0)
+
+	lockfile := filepath.Join(dir, "app.lock")
+	if err := os.WriteFile(lockfile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(lockfile, old, old); err != nil {
+		t.Fatal(err)
+	}
+	requireExitCode(t, runWaitfor(t, "lockfile", lockfile, "--older-than", "30m"), 0)
+
+	permfile := filepath.Join(dir, "mode")
+	if err := os.WriteFile(permfile, []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// #nosec G302 -- black-box test validates non-0600 permission matching.
+	if err := os.Chmod(permfile, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	requireExitCode(t, runWaitfor(t, "permission", permfile, "--mode", "0640", "--type", "file"), 0)
+
+	checksum := filepath.Join(dir, "checksum")
+	if err := os.WriteFile(checksum, []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	requireExitCode(t, runWaitfor(t, "checksum", checksum, "--equals", "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"), 0)
+
+	archive := filepath.Join(dir, "app.zip")
+	writeBlackboxZipArchive(t, archive, "bin/app")
+	requireExitCode(t, runWaitfor(t, "archive", archive, "--matches", "bin/*"), 0)
+}
+
+func TestBinaryExtraCommandBackends(t *testing.T) {
+	requireBlackbox(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("fake command scripts require /bin/sh")
+	}
+	dir := t.TempDir()
+	writeBlackboxExecutable(t, dir, "launchctl", "#!/bin/sh\nprintf 'pid = 123\\nstate = running\\n'\n")
+	writeBlackboxExecutable(t, dir, "cosign", "#!/bin/sh\nexit 0\n")
+	writeBlackboxExecutable(t, dir, "ping", "#!/bin/sh\nexit 0\n")
+	t.Setenv("PATH", dir)
+
+	requireExitCode(t, runWaitfor(t, "launchd", "system/com.example.agent", "--running"), 0)
+	requireExitCode(t, runWaitfor(t, "cosign", "--blob", filepath.Join(dir, "artifact"), "--signature", filepath.Join(dir, "artifact.sig")), 0)
+	requireExitCode(t, runWaitfor(t, "icmp", "127.0.0.1", "--count", "2", "--timeout", "500ms"), 0)
+}
+
+func TestBinaryExtraProtocolBackends(t *testing.T) {
+	requireBlackbox(t)
+
+	requireExitCode(t, runWaitfor(t, "ntp", newBlackboxNTPServer(t, 0), "--max-offset", "5s", "--timeout", "500ms"), 0)
+	requireExitCode(t, runWaitfor(t, "grpc", newBlackboxGRPCHealthServer(t, 1), "--service", "svc"), 0)
+	requireExitCode(t, runWaitfor(t, "websocket", newBlackboxWebSocketServer(t, "ready"), "--send", "hello", "--contains", "ready", "--header", "Authorization=Bearer token", "--timeout", "500ms"), 0)
 }
 
 func TestBinarySystemdInvalidArgs(t *testing.T) {
