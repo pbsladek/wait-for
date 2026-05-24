@@ -30,6 +30,7 @@ type HTTPCondition struct {
 	Insecure       bool
 	NoRedirects    bool
 	Headers        map[string]string
+	ClientCert     *tls.Certificate
 	Client         *http.Client
 	clientOnce     sync.Once
 	clientCache    *http.Client
@@ -359,30 +360,16 @@ func (c *HTTPCondition) statusMatcher() HTTPStatusMatcher {
 	return status
 }
 
-func buildInsecureTransport() http.RoundTripper {
-	if base, ok := http.DefaultTransport.(*http.Transport); ok {
-		cloned := base.Clone()
-		cloned.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
-		return cloned
-	}
-	return &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
-	}
-}
-
 func (c *HTTPCondition) client() *http.Client {
 	if c.Client != nil {
 		return c.Client
 	}
 	needsRedirectPolicy := len(c.Headers) > 0
-	if !c.Insecure && !c.NoRedirects && !needsRedirectPolicy {
+	if !c.Insecure && c.ClientCert == nil && !c.NoRedirects && !needsRedirectPolicy {
 		return http.DefaultClient
 	}
 	c.clientOnce.Do(func() {
-		transport := http.DefaultTransport
-		if c.Insecure {
-			transport = buildInsecureTransport()
-		}
+		transport := buildHTTPTransport(c.Insecure, c.ClientCert)
 		c.clientCache = &http.Client{
 			Timeout:   30 * time.Second,
 			Transport: transport,
@@ -390,6 +377,32 @@ func (c *HTTPCondition) client() *http.Client {
 		configureHTTPRedirectPolicy(c.clientCache, c, needsRedirectPolicy)
 	})
 	return c.clientCache
+}
+
+func buildHTTPTransport(insecure bool, cert *tls.Certificate) http.RoundTripper {
+	if cert == nil && !insecure {
+		return http.DefaultTransport
+	}
+	var transport *http.Transport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = base.Clone()
+	} else {
+		transport = &http.Transport{}
+	}
+	tlsConfig := transport.TLSClientConfig
+	if tlsConfig == nil {
+		tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	} else {
+		tlsConfig = tlsConfig.Clone()
+	}
+	if insecure {
+		tlsConfig.InsecureSkipVerify = true //nolint:gosec
+	}
+	if cert != nil {
+		tlsConfig.Certificates = []tls.Certificate{*cert}
+	}
+	transport.TLSClientConfig = tlsConfig
+	return transport
 }
 
 func configureHTTPRedirectPolicy(client *http.Client, c *HTTPCondition, needsRedirectPolicy bool) {

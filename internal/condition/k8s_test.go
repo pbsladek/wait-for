@@ -3,6 +3,7 @@ package condition
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/pbsladek/wait-for/internal/expr"
@@ -159,6 +160,21 @@ func TestKubernetesConditionDeploymentRolloutProgressDeadlineFatal(t *testing.T)
 	result := cond.Check(t.Context())
 	if result.Status != CheckFatal {
 		t.Fatalf("status = %s, want fatal", result.Status)
+	}
+}
+
+func TestKubernetesRolloutDiagnosticsIncludeConditions(t *testing.T) {
+	obj := rolloutDeployObject(3, 3, 1, 1, 2, 2)
+	obj.Object["status"].(map[string]any)["conditions"] = []any{
+		map[string]any{"type": "Available", "status": "False", "reason": "MinimumReplicasUnavailable", "message": "waiting for pods"},
+	}
+	cond := NewKubernetes("deployment/myapp")
+	cond.WaitFor = "rollout"
+	cond.Getter = NewDynamicKubernetesGetterWithClient(fake.NewSimpleDynamicClient(runtime.NewScheme(), obj))
+
+	result := cond.Check(t.Context())
+	if result.Status != CheckUnsatisfied || !strings.Contains(result.Detail, "conditions: Available=False") || !strings.Contains(result.Detail, "waiting for pods") {
+		t.Fatalf("result = %+v, want condition diagnostics", result)
 	}
 }
 

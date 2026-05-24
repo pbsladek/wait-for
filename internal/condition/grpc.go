@@ -21,6 +21,7 @@ const (
 	maxGRPCResponseBytes    = 4 * 1024 * 1024
 	maxGRPCServiceNameBytes = 1024
 	grpcHealthPath          = "/grpc.health.v1.Health/Check"
+	grpcReflectionPath      = "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo"
 )
 
 type GRPCServingStatus string
@@ -35,6 +36,8 @@ const (
 type GRPCCondition struct {
 	Address        string
 	Service        string
+	Method         string
+	Reflect        bool
 	Status         GRPCServingStatus
 	UseTLS         bool
 	AttemptTimeout time.Duration
@@ -68,22 +71,60 @@ func validateGRPCConfig(c *GRPCCondition) error {
 	if strings.TrimSpace(c.Address) == "" {
 		return fmt.Errorf("grpc address is required")
 	}
-	switch c.Status {
-	case GRPCStatusServing, GRPCStatusNotServing, GRPCStatusUnknown, GRPCStatusServiceUnknown:
-	default:
-		return fmt.Errorf("unsupported grpc health status %q", c.Status)
+	if err := validateGRPCStatus(c.Status); err != nil {
+		return err
 	}
-	if c.AttemptTimeout < 0 {
+	if err := validateGRPCTiming(c.AttemptTimeout); err != nil {
+		return err
+	}
+	if err := validateGRPCTransport(c.Address, c.UseTLS); err != nil {
+		return err
+	}
+	if err := validateGRPCService(c.Service); err != nil {
+		return err
+	}
+	return validateGRPCMethod(c.Method)
+}
+
+func validateGRPCStatus(status GRPCServingStatus) error {
+	switch status {
+	case GRPCStatusServing, GRPCStatusNotServing, GRPCStatusUnknown, GRPCStatusServiceUnknown:
+		return nil
+	default:
+		return fmt.Errorf("unsupported grpc health status %q", status)
+	}
+}
+
+func validateGRPCTiming(timeout time.Duration) error {
+	if timeout < 0 {
 		return fmt.Errorf("--timeout must be non-negative")
 	}
-	if c.UseTLS && grpcAddressIsCleartext(c.Address) {
+	return nil
+}
+
+func validateGRPCTransport(address string, useTLS bool) error {
+	if useTLS && grpcAddressIsCleartext(address) {
 		return fmt.Errorf("grpc --tls cannot be used with a cleartext URL scheme")
 	}
-	if !utf8.ValidString(c.Service) {
+	return nil
+}
+
+func validateGRPCService(service string) error {
+	if !utf8.ValidString(service) {
 		return fmt.Errorf("grpc service name must be valid UTF-8")
 	}
-	if len(c.Service) > maxGRPCServiceNameBytes {
+	if len(service) > maxGRPCServiceNameBytes {
 		return fmt.Errorf("grpc service name is too long")
+	}
+	return nil
+}
+
+func validateGRPCMethod(method string) error {
+	if method == "" {
+		return nil
+	}
+	if !strings.HasPrefix(method, "/") || strings.ContainsAny(method, "?#") {
+		return fmt.Errorf("grpc method must be an absolute /Service/Method path")
 	}
 	return nil
 }
@@ -93,7 +134,12 @@ func (c *GRPCCondition) check(ctx context.Context) (GRPCServingStatus, error) {
 	if client == nil {
 		client = grpcHTTPClient(c.AttemptTimeout, grpcAddressUsesTLS(c.Address, c.UseTLS))
 	}
-	req, err := grpcHealthRequest(ctx, c.Address, c.Service, c.UseTLS)
+	if c.Reflect {
+		if err := c.checkReflection(ctx, client); err != nil {
+			return "", err
+		}
+	}
+	req, err := grpcHealthRequest(ctx, c.Address, c.Service, c.Method, c.UseTLS)
 	if err != nil {
 		return "", err
 	}
@@ -103,6 +149,39 @@ func (c *GRPCCondition) check(ctx context.Context) (GRPCServingStatus, error) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	return parseGRPCHealthResponse(resp)
+}
+
+func (c *GRPCCondition) checkReflection(ctx context.Context, client *http.Client) error {
+	symbol := grpcReflectionSymbol(c)
+	req, err := grpcReflectionRequest(ctx, c.Address, symbol, c.UseTLS)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return parseGRPCReflectionResponse(resp, symbol)
+}
+
+func grpcReflectionSymbol(c *GRPCCondition) string {
+	if c.Method != "" {
+		return grpcServiceFromMethod(c.Method)
+	}
+	if c.Service != "" {
+		return c.Service
+	}
+	return "grpc.health.v1.Health"
+}
+
+func grpcServiceFromMethod(method string) string {
+	method = strings.TrimPrefix(method, "/")
+	service, _, ok := strings.Cut(method, "/")
+	if !ok {
+		return method
+	}
+	return service
 }
 
 func grpcHTTPClient(timeout time.Duration, useTLS bool) *http.Client {
@@ -135,8 +214,8 @@ func grpcAddressIsCleartext(address string) bool {
 	return strings.HasPrefix(address, "grpc://") || strings.HasPrefix(address, "http://")
 }
 
-func grpcHealthRequest(ctx context.Context, address, service string, useTLS bool) (*http.Request, error) {
-	endpoint, err := grpcHealthURL(address, useTLS)
+func grpcHealthRequest(ctx context.Context, address, service, method string, useTLS bool) (*http.Request, error) {
+	endpoint, err := grpcHealthURL(address, method, useTLS)
 	if err != nil {
 		return nil, err
 	}
@@ -150,15 +229,30 @@ func grpcHealthRequest(ctx context.Context, address, service string, useTLS bool
 	return req, nil
 }
 
-func grpcHealthURL(address string, useTLS bool) (string, error) {
+func grpcReflectionRequest(ctx context.Context, address, symbol string, useTLS bool) (*http.Request, error) {
+	endpoint, err := grpcHealthURL(address, grpcReflectionPath, useTLS)
+	if err != nil {
+		return nil, err
+	}
+	body := grpcFrame(encodeGRPCReflectionRequest(symbol))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/grpc")
+	req.Header.Set("TE", "trailers")
+	return req, nil
+}
+
+func grpcHealthURL(address string, method string, useTLS bool) (string, error) {
 	if strings.HasPrefix(address, "grpc://") {
-		return grpcSchemeURL(address, "grpc", "http")
+		return grpcSchemeURL(address, "grpc", "http", method)
 	}
 	if strings.HasPrefix(address, "grpcs://") {
-		return grpcSchemeURL(address, "grpcs", "https")
+		return grpcSchemeURL(address, "grpcs", "https", method)
 	}
 	if urlHasHTTPScheme(address) {
-		return grpcHTTPURL(address)
+		return grpcHTTPURL(address, method)
 	}
 	if strings.Contains(address, "://") {
 		return "", fmt.Errorf("invalid grpc address %q", address)
@@ -167,9 +261,9 @@ func grpcHealthURL(address string, useTLS bool) (string, error) {
 		return "", fmt.Errorf("invalid grpc address %q: %w", address, err)
 	}
 	if useTLS {
-		return "https://" + address + grpcHealthPath, nil
+		return "https://" + address + grpcMethodPath(method), nil
 	}
-	return "http://" + address + grpcHealthPath, nil
+	return "http://" + address + grpcMethodPath(method), nil
 }
 
 func urlHasHTTPScheme(address string) bool {
@@ -177,7 +271,7 @@ func urlHasHTTPScheme(address string) bool {
 	return err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https")
 }
 
-func grpcHTTPURL(address string) (string, error) {
+func grpcHTTPURL(address string, method string) (string, error) {
 	parsed, err := url.ParseRequestURI(address)
 	if err != nil || parsed.Host == "" {
 		return "", fmt.Errorf("invalid grpc address %q", address)
@@ -185,11 +279,11 @@ func grpcHTTPURL(address string) (string, error) {
 	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return "", fmt.Errorf("grpc address cannot include userinfo, query, or fragment")
 	}
-	parsed.Path = strings.TrimRight(parsed.Path, "/") + grpcHealthPath
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + grpcMethodPath(method)
 	return parsed.String(), nil
 }
 
-func grpcSchemeURL(address, sourceScheme, targetScheme string) (string, error) {
+func grpcSchemeURL(address, sourceScheme, targetScheme string, method string) (string, error) {
 	parsed, err := url.Parse(address)
 	if err != nil || parsed.Scheme != sourceScheme || parsed.Host == "" {
 		return "", fmt.Errorf("invalid grpc address %q", address)
@@ -198,8 +292,15 @@ func grpcSchemeURL(address, sourceScheme, targetScheme string) (string, error) {
 		return "", fmt.Errorf("grpc address cannot include userinfo, query, or fragment")
 	}
 	parsed.Scheme = targetScheme
-	parsed.Path = strings.TrimRight(parsed.Path, "/") + grpcHealthPath
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + grpcMethodPath(method)
 	return parsed.String(), nil
+}
+
+func grpcMethodPath(method string) string {
+	if method == "" {
+		return grpcHealthPath
+	}
+	return method
 }
 
 func encodeGRPCHealthRequest(service string) []byte {
@@ -210,6 +311,17 @@ func encodeGRPCHealthRequest(service string) []byte {
 	out := []byte{0x0a}
 	out = appendVarint(out, uint64(len(payload)))
 	return append(out, payload...)
+}
+
+func encodeGRPCReflectionRequest(symbol string) []byte {
+	out := appendProtoString(nil, 4, symbol)
+	return out
+}
+
+func appendProtoString(out []byte, fieldNumber uint64, value string) []byte {
+	out = appendVarint(out, fieldNumber<<3|2)
+	out = appendVarint(out, uint64(len(value)))
+	return append(out, value...)
 }
 
 func grpcFrame(payload []byte) []byte {
@@ -228,35 +340,57 @@ func uint32Length(length int) uint32 {
 	return uint32(length)
 }
 
-func parseGRPCHealthResponse(resp *http.Response) (GRPCServingStatus, error) {
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("grpc health HTTP status %d", resp.StatusCode)
-	}
-	if !validGRPCContentType(resp.Header.Get("Content-Type")) {
-		return "", fmt.Errorf("grpc response content-type is not application/grpc")
-	}
-	if resp.Body == nil {
-		return "", fmt.Errorf("grpc response body is missing")
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxGRPCResponseBytes+1))
+func parseGRPCReflectionResponse(resp *http.Response, symbol string) error {
+	payload, err := parseGRPCPayloadResponse(resp)
 	if err != nil {
-		return "", err
+		return err
 	}
-	if len(body) > maxGRPCResponseBytes {
-		return "", fmt.Errorf("grpc response too large")
+	ok, reflectionErr, err := decodeGRPCReflectionResponse(payload)
+	if err != nil {
+		return err
 	}
-	status := grpcStatus(resp)
-	if status == "" {
-		return "", fmt.Errorf("grpc status missing")
+	if reflectionErr != "" {
+		return fmt.Errorf("grpc reflection %s: %s", symbol, reflectionErr)
 	}
-	if status != "0" {
-		return "", fmt.Errorf("grpc status %s", status)
+	if !ok {
+		return fmt.Errorf("grpc reflection response missing descriptor for %s", symbol)
 	}
-	payload, err := parseGRPCFrame(body)
+	return nil
+}
+
+func parseGRPCHealthResponse(resp *http.Response) (GRPCServingStatus, error) {
+	payload, err := parseGRPCPayloadResponse(resp)
 	if err != nil {
 		return "", err
 	}
 	return decodeGRPCHealthStatus(payload)
+}
+
+func parseGRPCPayloadResponse(resp *http.Response) ([]byte, error) {
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("grpc HTTP status %d", resp.StatusCode)
+	}
+	if !validGRPCContentType(resp.Header.Get("Content-Type")) {
+		return nil, fmt.Errorf("grpc response content-type is not application/grpc")
+	}
+	if resp.Body == nil {
+		return nil, fmt.Errorf("grpc response body is missing")
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxGRPCResponseBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxGRPCResponseBytes {
+		return nil, fmt.Errorf("grpc response too large")
+	}
+	status := grpcStatus(resp)
+	if status == "" {
+		return nil, fmt.Errorf("grpc status missing")
+	}
+	if status != "0" {
+		return nil, fmt.Errorf("grpc status %s", status)
+	}
+	return parseGRPCFrame(body)
 }
 
 func validGRPCContentType(value string) bool {
@@ -308,6 +442,83 @@ func decodeGRPCHealthStatus(payload []byte) (GRPCServingStatus, error) {
 	default:
 		return "", fmt.Errorf("unsupported grpc health status code %d", value)
 	}
+}
+
+func decodeGRPCReflectionResponse(payload []byte) (bool, string, error) {
+	for len(payload) > 0 {
+		key, n := readVarint(payload)
+		if n == 0 {
+			return false, "", fmt.Errorf("malformed grpc reflection field key")
+		}
+		payload = payload[n:]
+		fieldNumber := key >> 3
+		wireType := key & 0x7
+		if fieldNumber == 4 && wireType == 2 {
+			return true, "", nil
+		}
+		if fieldNumber == 7 && wireType == 2 {
+			message, _, err := grpcReflectionError(payload)
+			return false, message, err
+		}
+		rest, err := skipProtoField(payload, wireType)
+		if err != nil {
+			return false, "", err
+		}
+		payload = rest
+	}
+	return false, "", nil
+}
+
+func grpcReflectionError(payload []byte) (string, []byte, error) {
+	messagePayload, rest, err := protoMessagePayload(payload)
+	if err != nil {
+		return "", nil, err
+	}
+	message, err := grpcReflectionErrorMessage(messagePayload)
+	return message, rest, err
+}
+
+func protoMessagePayload(payload []byte) ([]byte, []byte, error) {
+	size, n := readVarint(payload)
+	if n == 0 || protoLengthExceedsAvailable(size, len(payload)-n) {
+		return nil, nil, fmt.Errorf("malformed grpc reflection error")
+	}
+	end := n + checkedProtoLength(size)
+	return payload[n:end], payload[end:], nil
+}
+
+func grpcReflectionErrorMessage(payload []byte) (string, error) {
+	for len(payload) > 0 {
+		key, n := readVarint(payload)
+		if n == 0 {
+			return "", fmt.Errorf("malformed grpc reflection error field")
+		}
+		payload = payload[n:]
+		fieldNumber := key >> 3
+		wireType := key & 0x7
+		if fieldNumber == 2 && wireType == 2 {
+			message, _, err := protoStringField(payload)
+			if err != nil {
+				return "", err
+			}
+			return message, nil
+		}
+		rest, err := skipProtoField(payload, wireType)
+		if err != nil {
+			return "", err
+		}
+		payload = rest
+	}
+	return "symbol not found", nil
+}
+
+func protoStringField(payload []byte) (string, []byte, error) {
+	size, n := readVarint(payload)
+	if n == 0 || protoLengthExceedsAvailable(size, len(payload)-n) {
+		return "", nil, fmt.Errorf("malformed grpc reflection string")
+	}
+	end := n + checkedProtoLength(size)
+	return string(payload[n:end]), payload[end:], nil
 }
 
 func findGRPCHealthStatus(payload []byte) (uint64, bool, error) {

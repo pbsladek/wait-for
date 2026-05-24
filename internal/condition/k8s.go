@@ -24,6 +24,10 @@ type KubernetesGetter interface {
 	List(ctx context.Context, resource string, namespace string, selector string) ([]map[string]any, error)
 }
 
+type KubernetesDiagnosticsGetter interface {
+	WarningEvents(ctx context.Context, obj map[string]any, namespace string) ([]string, error)
+}
+
 type KubernetesCondition struct {
 	Resource   string
 	Namespace  string
@@ -66,7 +70,7 @@ func (c *KubernetesCondition) Check(ctx context.Context) Result {
 		return classifyK8sGetterError(err)
 	}
 	if c.WaitFor != "" {
-		return checkK8sWaitFor(obj, c.WaitFor)
+		return enrichK8sResult(ctx, getter, obj, c.Namespace, checkK8sWaitFor(obj, c.WaitFor))
 	}
 	if c.JSONExpr != nil {
 		return checkK8sJSONExpr(obj, c.JSONExpr)
@@ -485,6 +489,66 @@ func k8sRolloutUnsatisfied(label string, got, want int64) Result {
 	return Unsatisfied(detail, errors.New(detail))
 }
 
+func enrichK8sResult(ctx context.Context, getter KubernetesGetter, obj map[string]any, namespace string, result Result) Result {
+	if result.Status == CheckSatisfied {
+		return result
+	}
+	diagnostics := k8sStatusDiagnostics(ctx, getter, obj, namespace)
+	if diagnostics == "" {
+		return result
+	}
+	result.Detail += diagnostics
+	if result.Err != nil {
+		result.Err = fmt.Errorf("%s", result.Detail)
+	}
+	return result
+}
+
+func k8sStatusDiagnostics(ctx context.Context, getter KubernetesGetter, obj map[string]any, namespace string) string {
+	parts := k8sConditionSummaries(obj)
+	if diagGetter, ok := getter.(KubernetesDiagnosticsGetter); ok {
+		if warnings, err := diagGetter.WarningEvents(ctx, obj, namespace); err == nil {
+			for _, warning := range warnings {
+				parts = append(parts, "warning="+warning)
+			}
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "; conditions: " + strings.Join(parts, "; ")
+}
+
+func k8sConditionSummaries(obj map[string]any) []string {
+	conditions, ok, err := unstructured.NestedSlice(obj, "status", "conditions")
+	if err != nil || !ok {
+		return nil
+	}
+	summaries := make([]string, 0, len(conditions))
+	for _, raw := range conditions {
+		cond, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		t, _, _ := unstructured.NestedString(cond, "type")
+		status, _, _ := unstructured.NestedString(cond, "status")
+		reason, _, _ := unstructured.NestedString(cond, "reason")
+		message, _, _ := unstructured.NestedString(cond, "message")
+		if t == "" {
+			continue
+		}
+		summary := t + "=" + status
+		if reason != "" {
+			summary += " reason=" + reason
+		}
+		if message != "" {
+			summary += " message=" + message
+		}
+		summaries = append(summaries, summary)
+	}
+	return summaries
+}
+
 func k8sInt64(obj map[string]any, fields ...string) int64 {
 	value, ok, _ := unstructured.NestedInt64(obj, fields...)
 	if ok {
@@ -566,6 +630,33 @@ func (g *DynamicKubernetesGetter) List(ctx context.Context, resource string, nam
 		items = append(items, item.Object)
 	}
 	return items, nil
+}
+
+func (g *DynamicKubernetesGetter) WarningEvents(ctx context.Context, obj map[string]any, namespace string) ([]string, error) {
+	uid, _, _ := unstructured.NestedString(obj, "metadata", "uid")
+	if uid == "" {
+		return nil, nil
+	}
+	gvr := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "events"}
+	opts := v1.ListOptions{FieldSelector: "involvedObject.uid=" + uid + ",type=Warning"}
+	list, err := g.client.Resource(gvr).Namespace(namespace).List(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	warnings := make([]string, 0, len(list.Items))
+	for _, item := range list.Items {
+		reason, _, _ := unstructured.NestedString(item.Object, "reason")
+		message, _, _ := unstructured.NestedString(item.Object, "message")
+		if reason == "" && message == "" {
+			continue
+		}
+		if reason != "" && message != "" {
+			warnings = append(warnings, reason+": "+message)
+			continue
+		}
+		warnings = append(warnings, reason+message)
+	}
+	return warnings, nil
 }
 
 func buildKubeConfig(kubeconfig string) (*rest.Config, error) {

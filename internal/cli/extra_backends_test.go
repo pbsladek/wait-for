@@ -22,8 +22,8 @@ func TestParseExtraBackends(t *testing.T) {
 		{"cosign", []string{"cosign", "--blob", "artifact", "--signature", "artifact.sig", "--certificate-identity", "id", "--certificate-oidc-issuer", "issuer"}, condition.CosignBlob},
 		{"ntp", []string{"ntp", "127.0.0.1:123", "--max-offset", "1s", "--timeout", "500ms"}, "ntp"},
 		{"icmp", []string{"icmp", "127.0.0.1", "--count", "3", "--timeout", "2s"}, "icmp"},
-		{"grpc", []string{"grpc", "127.0.0.1:50051", "--service", "svc", "--tls", "--timeout", "2s"}, "grpc"},
-		{"websocket", []string{"websocket", "ws://127.0.0.1/ready", "--matches", "ready", "--header", "Authorization=Bearer token", "--timeout", "2s"}, "websocket"},
+		{"grpc", []string{"grpc", "127.0.0.1:50051", "--service", "svc", "--method", "/custom.Service/Ready", "--reflect", "--tls", "--timeout", "2s"}, "grpc"},
+		{"websocket", []string{"websocket", "ws://127.0.0.1/ready", "--matches", "ready", "--ping", "--expect-close-code", "1000", "--read-timeout", "1s", "--header", "Authorization=Bearer token", "--timeout", "2s"}, "websocket"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -96,13 +96,38 @@ func assertParsedBackendDetails(t *testing.T, cond condition.Condition) {
 			t.Fatalf("icmp = %+v", got)
 		}
 	case *condition.GRPCCondition:
-		if !got.UseTLS || got.AttemptTimeout != 2*time.Second {
+		if !got.UseTLS || !got.Reflect || got.Method != "/custom.Service/Ready" || got.AttemptTimeout != 2*time.Second {
 			t.Fatalf("grpc = %+v", got)
 		}
 	case *condition.WebSocketCondition:
-		if got.Matches == nil || got.Headers["Authorization"] != "Bearer token" || got.AttemptTimeout != 2*time.Second {
+		if got.Matches == nil || !got.Ping || got.ExpectCloseCode != 1000 || got.ReadTimeout != time.Second || got.Headers["Authorization"] != "Bearer token" || got.AttemptTimeout != 2*time.Second {
 			t.Fatalf("websocket = %+v", got)
 		}
+	}
+}
+
+func TestParseHTTPAuthHelpers(t *testing.T) {
+	cond, err := parseHTTPCondition([]string{"http", "https://example.test/ready", "--bearer-token", "token"})
+	if err != nil {
+		t.Fatalf("parseHTTPCondition bearer error = %v", err)
+	}
+	httpCond := cond.(*condition.HTTPCondition)
+	if httpCond.Headers["Authorization"] != "Bearer token" {
+		t.Fatalf("Authorization = %q", httpCond.Headers["Authorization"])
+	}
+	cond, err = parseHTTPCondition([]string{"http", "https://example.test/ready", "--basic-user", "u", "--basic-password", "p"})
+	if err != nil {
+		t.Fatalf("parseHTTPCondition basic error = %v", err)
+	}
+	httpCond = cond.(*condition.HTTPCondition)
+	if httpCond.Headers["Authorization"] != "Basic dTpw" {
+		t.Fatalf("Authorization = %q", httpCond.Headers["Authorization"])
+	}
+	if _, err := parseHTTPCondition([]string{"http", "https://example.test/ready", "--header", "Authorization=raw", "--bearer-token", "token"}); err == nil {
+		t.Fatal("authorization helper with header succeeded")
+	}
+	if _, err := parseHTTPCondition([]string{"http", "https://example.test/ready", "--client-cert", "cert.pem"}); err == nil {
+		t.Fatal("client cert without key succeeded")
 	}
 }
 

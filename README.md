@@ -115,15 +115,19 @@ Global flags:
                        Per-attempt deadline; 0 disables per-attempt limit
 --successes int        Consecutive successful checks required (default: 1)
 --stable-for duration  Required continuous success duration (default: disabled)
---output text|json     Output format (default: text)
+--output text|json|ndjson
+                       Output format (default: text)
 --mode all|any         Condition mode (default: all)
 --verbose              Show each attempt
+--profile ci|local     Apply default timeout/interval/output profile
+--config path          Load a YAML recipe file
+--explain, --dry-run   Show the parsed plan without running checks
 ```
 
 Backends:
 
 ```text
-http URL [--status 200|2xx] [--method GET] [--body text] [--body-file path] [--body-contains text] [--body-matches regex] [--jsonpath expr] [--header K=V] [--insecure] [--no-follow-redirects]
+http URL [--status 200|2xx] [--method GET] [--body text] [--body-file path] [--body-contains text] [--body-matches regex] [--jsonpath expr] [--header K=V] [--bearer-token TOKEN] [--basic-user USER --basic-password PASS] [--client-cert CERT --client-key KEY] [--insecure] [--no-follow-redirects]
 tcp HOST:PORT
 unix PATH
 ports HOST --range START-END [--any|--all]
@@ -131,6 +135,8 @@ tls HOST:PORT [--servername name] [--valid-for duration] [--ca-file path]
 ssh HOST:PORT [--banner-contains text] [--user name --password value] [--host-key-sha256 SHA256:...]
 s3 s3://bucket[/key] [--exists] [--metadata K=V] [--contains text] [--endpoint-url URL] [--virtual-hosted-style] [--region name]
 dns HOST [--resolver system|wire] [--type A|AAAA|CNAME|TXT|ANY|MX|SRV|NS|CAA|HTTPS|SVCB] [--contains text] [--equals value] [--min-count N] [--absent] [--absent-mode any|nxdomain|nodata] [--server address] [--rcode code] [--transport udp|tcp] [--edns0] [--udp-size N]
+grpc ADDRESS [--service NAME] [--method /pkg.Service/Method] [--reflect] [--status SERVING|NOT_SERVING|UNKNOWN|SERVICE_UNKNOWN] [--tls] [--timeout DURATION]
+websocket ws://HOST/PATH [--send TEXT] [--contains TEXT|--matches REGEX] [--ping] [--expect-close-code N] [--read-timeout DURATION] [--header K=V] [--timeout DURATION]
 docker CONTAINER [--status running] [--health healthy]
 process (--pid PID | --name NAME) [--running|--stopped]
 systemd UNIT [--active|--inactive|--failed]
@@ -244,6 +250,10 @@ waitfor --output json http https://api.example.com/health --status 200
 waitfor --output json --mode any \
   http https://primary.example.com/health \
   -- http https://fallback.example.com/health
+
+waitfor --output ndjson http https://api.example.com/health --status 200
+
+waitfor --config waitfor.yaml --explain
 ```
 
 Multiple conditions are chained with `--` before the next backend:
@@ -310,11 +320,16 @@ comma-separated values.
 waitfor doctor --output json
 
 waitfor doctor --require docker,k8s --output json
+
+waitfor doctor --backend docker --backend k8s --output json
 ```
 
 ```text
-waitfor doctor [--output text|json] [--require temp|shell|docker|k8s|dns-wire]
+waitfor doctor [--output text|json] [--require temp|shell|docker|k8s|dns-wire] [--backend name]
 ```
+
+Workflow-oriented examples live in [`docs/workflows.md`](docs/workflows.md).
+The backend conformance test matrix lives in [`docs/conformance.md`](docs/conformance.md).
 
 ## JSON Expressions
 

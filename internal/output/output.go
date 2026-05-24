@@ -13,8 +13,9 @@ import (
 type Format string
 
 const (
-	FormatText Format = "text"
-	FormatJSON Format = "json"
+	FormatText   Format = "text"
+	FormatJSON   Format = "json"
+	FormatNDJSON Format = "ndjson"
 )
 
 const maxTextFieldBytes = 512
@@ -61,8 +62,26 @@ type ConditionReport struct {
 	ElapsedSeconds float64 `json:"elapsed_seconds"`
 	Detail         string  `json:"detail,omitempty"`
 	LastError      string  `json:"last_error,omitempty"`
+	Reason         string  `json:"reason,omitempty"`
+	Suggestion     string  `json:"suggestion,omitempty"`
 	Fatal          bool    `json:"fatal,omitempty"`
 	Guard          bool    `json:"guard,omitempty"`
+}
+
+type ndjsonEvent struct {
+	Event           string            `json:"event"`
+	Status          string            `json:"status,omitempty"`
+	ConditionCount  int               `json:"condition_count,omitempty"`
+	TimeoutSeconds  float64           `json:"timeout_seconds,omitempty"`
+	IntervalSeconds float64           `json:"interval_seconds,omitempty"`
+	Name            string            `json:"name,omitempty"`
+	Attempt         int               `json:"attempt,omitempty"`
+	Satisfied       bool              `json:"satisfied,omitempty"`
+	Detail          string            `json:"detail,omitempty"`
+	Error           string            `json:"error,omitempty"`
+	ElapsedSeconds  float64           `json:"elapsed_seconds,omitempty"`
+	Report          *Report           `json:"report,omitempty"`
+	Fields          map[string]string `json:"fields,omitempty"`
 }
 
 func NewPrinter(w io.Writer, format Format, verbose bool) *Printer {
@@ -70,6 +89,15 @@ func NewPrinter(w io.Writer, format Format, verbose bool) *Printer {
 }
 
 func (p *Printer) Start(count int, timeout time.Duration, interval time.Duration) {
+	if p.format == FormatNDJSON {
+		_ = p.writeNDJSON(ndjsonEvent{
+			Event:           "start",
+			ConditionCount:  count,
+			TimeoutSeconds:  Seconds(timeout),
+			IntervalSeconds: Seconds(interval),
+		})
+		return
+	}
 	if p.format != FormatText {
 		return
 	}
@@ -79,6 +107,18 @@ func (p *Printer) Start(count int, timeout time.Duration, interval time.Duration
 }
 
 func (p *Printer) Attempt(event Attempt) {
+	if p.format == FormatNDJSON {
+		_ = p.writeNDJSON(ndjsonEvent{
+			Event:          "attempt",
+			Name:           event.Name,
+			Attempt:        event.Attempt,
+			Satisfied:      event.Satisfied,
+			Detail:         event.Detail,
+			Error:          event.Error,
+			ElapsedSeconds: Seconds(event.Elapsed),
+		})
+		return
+	}
 	if p.format != FormatText {
 		return
 	}
@@ -102,6 +142,9 @@ func (p *Printer) Outcome(report Report) error {
 	if p.format == FormatJSON {
 		return WriteJSON(p.w, report)
 	}
+	if p.format == FormatNDJSON {
+		return p.writeNDJSON(ndjsonEvent{Event: "outcome", Status: report.Status, Report: &report})
+	}
 	switch report.Status {
 	case "satisfied":
 		_, _ = fmt.Fprintf(p.w, "[waitfor] conditions satisfied in %.3fs\n", report.ElapsedSeconds)
@@ -115,6 +158,13 @@ func (p *Printer) Outcome(report Report) error {
 	}
 	p.printUnsatisfiedConditions(report.Conditions)
 	return nil
+}
+
+func (p *Printer) writeNDJSON(event ndjsonEvent) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	enc := json.NewEncoder(p.w)
+	return enc.Encode(event)
 }
 
 func (p *Printer) printUnsatisfiedConditions(conditions []ConditionReport) {

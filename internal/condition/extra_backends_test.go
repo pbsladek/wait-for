@@ -657,10 +657,52 @@ func TestGRPCConditionCheckUsesHealthRequest(t *testing.T) {
 	}
 }
 
+func TestGRPCConditionReflectionCheck(t *testing.T) {
+	var paths []string
+	var reflectionBody []byte
+	cond := NewGRPC("127.0.0.1:50051")
+	cond.Method = "/custom.Service/Ready"
+	cond.Reflect = true
+	cond.Client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		paths = append(paths, req.URL.Path)
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if req.URL.Path == grpcReflectionPath {
+			reflectionBody = body
+			return grpcTestPayloadResponse(appendProtoString(nil, 4, "descriptor")), nil
+		}
+		return grpcTestResponse(1), nil
+	})}
+
+	if result := cond.Check(t.Context()); result.Status != CheckSatisfied {
+		t.Fatalf("grpc status = %s, err = %v", result.Status, result.Err)
+	}
+	if strings.Join(paths, ",") != grpcReflectionPath+",/custom.Service/Ready" {
+		t.Fatalf("paths = %v", paths)
+	}
+	if !bytes.Equal(reflectionBody, grpcFrame(encodeGRPCReflectionRequest("custom.Service"))) {
+		t.Fatalf("reflection body = %v", reflectionBody)
+	}
+}
+
 func TestGRPCHealthEncodingAndDecoding(t *testing.T) {
 	payload := encodeGRPCHealthRequest("svc")
 	if !bytes.Equal(payload, []byte{0x0a, 0x03, 's', 'v', 'c'}) {
 		t.Fatalf("payload = %v", payload)
+	}
+	defaultSymbol := grpcReflectionSymbol(NewGRPC("127.0.0.1:1"))
+	if defaultSymbol != "grpc.health.v1.Health" {
+		t.Fatalf("default reflection symbol = %q", defaultSymbol)
+	}
+	serviceSymbol := NewGRPC("127.0.0.1:1")
+	serviceSymbol.Service = "custom.Service"
+	if got := grpcReflectionSymbol(serviceSymbol); got != "custom.Service" {
+		t.Fatalf("service reflection symbol = %q", got)
+	}
+	if got := grpcServiceFromMethod("/custom.Service/Ready"); got != "custom.Service" {
+		t.Fatalf("method service = %q", got)
 	}
 	body := grpcFrame([]byte{0x08, 0x01})
 	resp := &http.Response{
@@ -685,7 +727,7 @@ func TestGRPCHealthURLAndErrorBranches(t *testing.T) {
 		"127.0.0.1:50051":     "http://127.0.0.1:50051/grpc.health.v1.Health/Check",
 	}
 	for input, want := range tests {
-		got, err := grpcHealthURL(input, false)
+		got, err := grpcHealthURL(input, "", false)
 		if err != nil {
 			t.Fatalf("grpcHealthURL(%q) error = %v", input, err)
 		}
@@ -693,10 +735,10 @@ func TestGRPCHealthURLAndErrorBranches(t *testing.T) {
 			t.Fatalf("grpcHealthURL(%q) = %q, want %q", input, got, want)
 		}
 	}
-	if _, err := grpcHealthURL("missing-port", false); err == nil {
+	if _, err := grpcHealthURL("missing-port", "", false); err == nil {
 		t.Fatal("missing grpc port succeeded")
 	}
-	if got, err := grpcHealthURL("example.com:443", true); err != nil || got != "https://example.com:443/grpc.health.v1.Health/Check" {
+	if got, err := grpcHealthURL("example.com:443", "", true); err != nil || got != "https://example.com:443/grpc.health.v1.Health/Check" {
 		t.Fatalf("forced TLS url = %q err=%v", got, err)
 	}
 	if _, err := parseGRPCFrame([]byte{0}); err == nil {
@@ -735,17 +777,20 @@ func TestGRPCHealthURLAndErrorBranches(t *testing.T) {
 	if _, err := parseGRPCHealthResponse(badContentType); err == nil {
 		t.Fatal("grpc non-grpc content-type succeeded")
 	}
-	if _, err := grpcHealthURL("httpx://example.com", false); err == nil {
+	if _, err := grpcHealthURL("httpx://example.com", "", false); err == nil {
 		t.Fatal("invalid grpc URL scheme succeeded")
 	}
-	if _, err := grpcHealthURL("https://example.com/base?debug=true#frag", false); err == nil {
+	if _, err := grpcHealthURL("https://example.com/base?debug=true#frag", "", false); err == nil {
 		t.Fatal("grpc query/fragment URL succeeded")
 	}
-	if _, err := grpcHealthURL("https://user@example.com/base", false); err == nil {
+	if _, err := grpcHealthURL("https://user@example.com/base", "", false); err == nil {
 		t.Fatal("grpc userinfo URL succeeded")
 	}
-	if got, err := grpcHealthURL("https://example.com/base", false); err != nil || got != "https://example.com/base/grpc.health.v1.Health/Check" {
+	if got, err := grpcHealthURL("https://example.com/base", "", false); err != nil || got != "https://example.com/base/grpc.health.v1.Health/Check" {
 		t.Fatalf("grpc HTTP URL = %q err=%v", got, err)
+	}
+	if got, err := grpcHealthURL("https://example.com/base", "/custom.Service/Ready", false); err != nil || got != "https://example.com/base/custom.Service/Ready" {
+		t.Fatalf("grpc custom method URL = %q err=%v", got, err)
 	}
 	headerStatus := &http.Response{
 		StatusCode: http.StatusOK,
@@ -805,6 +850,21 @@ func TestGRPCValidationAndProtoSkipBranches(t *testing.T) {
 	if validateGRPCConfig(tlsCleartext) == nil {
 		t.Fatal("grpc --tls with cleartext scheme succeeded")
 	}
+	badTimeout := NewGRPC("127.0.0.1:1")
+	badTimeout.AttemptTimeout = -time.Second
+	if validateGRPCConfig(badTimeout) == nil {
+		t.Fatal("negative grpc timeout succeeded")
+	}
+	badMethod := NewGRPC("127.0.0.1:1")
+	badMethod.Method = "Service/Check"
+	if validateGRPCConfig(badMethod) == nil {
+		t.Fatal("relative grpc method succeeded")
+	}
+	queryMethod := NewGRPC("127.0.0.1:1")
+	queryMethod.Method = "/Service/Check?debug=true"
+	if validateGRPCConfig(queryMethod) == nil {
+		t.Fatal("grpc method with query succeeded")
+	}
 
 	payload := []byte{
 		0x08, 0x05, // field 1 varint first so unsupported health status branch is exercised below
@@ -826,6 +886,25 @@ func TestGRPCValidationAndProtoSkipBranches(t *testing.T) {
 	}
 	if _, err := decodeGRPCHealthStatus([]byte{0x11, 1}); err == nil {
 		t.Fatal("truncated fixed64 field succeeded")
+	}
+	if err := parseGRPCReflectionResponse(grpcTestPayloadResponse(appendProtoString(nil, 4, "descriptor")), "svc"); err != nil {
+		t.Fatalf("reflection descriptor failed: %v", err)
+	}
+	reflectionErr := appendProtoString(nil, 2, "missing")
+	if err := parseGRPCReflectionResponse(grpcTestPayloadResponse(appendProtoString(nil, 7, string(reflectionErr))), "svc"); err == nil {
+		t.Fatal("reflection error response succeeded")
+	}
+	if err := parseGRPCReflectionResponse(grpcTestPayloadResponse(nil), "svc"); err == nil {
+		t.Fatal("reflection response without descriptor succeeded")
+	}
+	if _, _, err := decodeGRPCReflectionResponse([]byte{0x80}); err == nil {
+		t.Fatal("malformed reflection field key succeeded")
+	}
+	if _, _, err := decodeGRPCReflectionResponse(appendProtoString(nil, 7, string([]byte{0x80}))); err == nil {
+		t.Fatal("malformed reflection error field succeeded")
+	}
+	if message, err := grpcReflectionErrorMessage(appendProtoString(nil, 1, "ignored")); err != nil || message != "symbol not found" {
+		t.Fatalf("reflection fallback message = %q err=%v", message, err)
 	}
 }
 
@@ -880,6 +959,80 @@ func TestWebSocketConditionCheckAgainstLocalServer(t *testing.T) {
 	}
 	if got := receiveString(t, payloadC); got != "hello" {
 		t.Fatalf("payload = %q", got)
+	}
+	if err := receiveError(t, errC); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWebSocketPingAgainstLocalServer(t *testing.T) {
+	errC := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, rw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			errC <- err
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		if err := writeWebSocketSwitchingProtocols(rw, r); err != nil {
+			errC <- err
+			return
+		}
+		opcode, payload, err := readWebSocketClientFrame(rw)
+		if err != nil {
+			errC <- err
+			return
+		}
+		if opcode != websocketOpcodePing {
+			errC <- fmt.Errorf("opcode = %d", opcode)
+			return
+		}
+		if _, err := rw.Write(websocketServerFrame(0x8a, payload)); err != nil {
+			errC <- err
+			return
+		}
+		errC <- rw.Flush()
+	}))
+	t.Cleanup(server.Close)
+
+	cond := NewWebSocket("ws://" + strings.TrimPrefix(server.URL, "http://") + "/events")
+	cond.Ping = true
+	cond.ReadTimeout = time.Second
+	if result := cond.Check(t.Context()); result.Status != CheckSatisfied {
+		t.Fatalf("websocket status = %s, err = %v", result.Status, result.Err)
+	}
+	if err := receiveError(t, errC); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWebSocketExpectedCloseAgainstLocalServer(t *testing.T) {
+	errC := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, rw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			errC <- err
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		if err := writeWebSocketSwitchingProtocols(rw, r); err != nil {
+			errC <- err
+			return
+		}
+		payload := []byte{0x03, 0xe8}
+		if _, err := rw.Write(websocketServerFrame(0x88, payload)); err != nil {
+			errC <- err
+			return
+		}
+		errC <- rw.Flush()
+	}))
+	t.Cleanup(server.Close)
+
+	cond := NewWebSocket("ws://" + strings.TrimPrefix(server.URL, "http://") + "/events")
+	cond.ExpectCloseCode = 1000
+	cond.ReadTimeout = time.Second
+	if result := cond.Check(t.Context()); result.Status != CheckSatisfied {
+		t.Fatalf("websocket status = %s, err = %v", result.Status, result.Err)
 	}
 	if err := receiveError(t, errC); err != nil {
 		t.Fatal(err)
@@ -949,6 +1102,16 @@ func TestWebSocketHelpers(t *testing.T) {
 	largeHeaders.Headers["X-Big"] = strings.Repeat("x", maxWebSocketHeaderBytes+1)
 	if err := validateWebSocketConfig(largeHeaders); err == nil {
 		t.Fatal("oversized websocket headers succeeded")
+	}
+	negativeReadTimeout := NewWebSocket("ws://example.com/ready")
+	negativeReadTimeout.ReadTimeout = -time.Second
+	if err := validateWebSocketConfig(negativeReadTimeout); err == nil {
+		t.Fatal("negative websocket read timeout succeeded")
+	}
+	badCloseCode := NewWebSocket("ws://example.com/ready")
+	badCloseCode.ExpectCloseCode = 70000
+	if err := validateWebSocketConfig(badCloseCode); err == nil {
+		t.Fatal("oversized websocket close code succeeded")
 	}
 	if desc := NewWebSocket("wss://example.com/events?token=secret").Descriptor(); strings.Contains(desc.Target, "secret") {
 		t.Fatalf("descriptor leaked query secret: %+v", desc)
@@ -1298,9 +1461,13 @@ func TestWebSocketReadLengthExtended(t *testing.T) {
 }
 
 func grpcTestResponse(status byte) *http.Response {
+	return grpcTestPayloadResponse([]byte{0x08, status})
+}
+
+func grpcTestPayloadResponse(payload []byte) *http.Response {
 	return &http.Response{
 		StatusCode: http.StatusOK,
-		Body:       io.NopCloser(bytes.NewReader(grpcFrame([]byte{0x08, status}))),
+		Body:       io.NopCloser(bytes.NewReader(grpcFrame(payload))),
 		Header:     http.Header{"Content-Type": []string{"application/grpc"}},
 		Trailer:    http.Header{"Grpc-Status": []string{"0"}},
 	}
@@ -1326,6 +1493,14 @@ func receiveError(t *testing.T, ch <-chan error) error {
 		t.Fatal("timed out waiting for error")
 		return nil
 	}
+}
+
+func writeWebSocketSwitchingProtocols(rw *bufio.ReadWriter, r *http.Request) error {
+	accept := websocketAccept(r.Header.Get("Sec-WebSocket-Key"))
+	if _, err := fmt.Fprintf(rw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", accept); err != nil {
+		return err
+	}
+	return rw.Flush()
 }
 
 func readWebSocketClientFrame(r io.Reader) (byte, []byte, error) {

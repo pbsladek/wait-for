@@ -2,7 +2,9 @@ package cli
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -87,6 +89,12 @@ func newCommand(stdin io.Reader, stdout io.Writer, stderr io.Writer) *cobra.Comm
 				}
 				return nil
 			}
+			if isCompletionCommand(args) {
+				return runCompletion(args[1:], stdout)
+			}
+			if isBackendHelpCommand(args) {
+				return runBackendHelp(args[1:], stdout)
+			}
 			if wantsHelp(args) {
 				_, _ = io.WriteString(stdout, helpText())
 				return nil
@@ -119,6 +127,10 @@ type globalOptions struct {
 	format            output.Format
 	mode              runner.Mode
 	verbose           bool
+	explain           bool
+	configFile        string
+	profile           string
+	changed           map[string]bool
 }
 
 func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) (int, error) {
@@ -126,11 +138,24 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	if err != nil {
 		return ExitInvalid, err
 	}
+	if opts.configFile != "" {
+		var recipeConditions []condition.Condition
+		opts, recipeConditions, err = applyRecipeConfig(opts)
+		if err != nil {
+			return ExitInvalid, err
+		}
+		if len(rest) == 0 {
+			return runWithOptions(ctx, opts, recipeConditions, stdout, stderr)
+		}
+	}
 	conditions, err := parseConditions(rest)
 	if err != nil {
 		return ExitInvalid, err
 	}
+	return runWithOptions(ctx, opts, conditions, stdout, stderr)
+}
 
+func runWithOptions(ctx context.Context, opts globalOptions, conditions []condition.Condition, stdout io.Writer, stderr io.Writer) (int, error) {
 	runCfg := runner.Config{
 		Conditions:        conditions,
 		Timeout:           opts.timeout,
@@ -146,9 +171,12 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	if err := runner.ValidateConfig(runCfg); err != nil {
 		return ExitInvalid, err
 	}
+	if opts.explain {
+		return writeExplain(stdout, stderr, opts, runCfg)
+	}
 
 	outputWriter := stderr
-	if opts.format == output.FormatJSON {
+	if opts.format == output.FormatJSON || opts.format == output.FormatNDJSON {
 		outputWriter = stdout
 	}
 	printer := output.NewPrinter(outputWriter, opts.format, opts.verbose)
@@ -188,7 +216,7 @@ func exitCodeForStatus(status runner.Status) int {
 
 func applyFormatAndMode(opts globalOptions, format, mode string) (globalOptions, error) {
 	switch output.Format(format) {
-	case output.FormatText, output.FormatJSON:
+	case output.FormatText, output.FormatJSON, output.FormatNDJSON:
 		opts.format = output.Format(format)
 	default:
 		return opts, fmt.Errorf("invalid output format %q", format)
@@ -273,13 +301,25 @@ func parseGlobal(args []string) (globalOptions, []string, error) {
 	fs.StringVar(&format, "output", string(opts.format), "output format: text|json")
 	fs.StringVar(&mode, "mode", "all", "condition mode: all|any")
 	fs.BoolVar(&opts.verbose, "verbose", false, "show every attempt")
+	fs.BoolVar(&opts.explain, "explain", false, "show parsed plan without running")
+	fs.BoolVar(&opts.explain, "dry-run", false, "alias for --explain")
+	fs.StringVar(&opts.configFile, "config", "", "YAML recipe file")
+	fs.StringVar(&opts.profile, "profile", os.Getenv("WAITFOR_PROFILE"), "defaults profile: ci|local")
 	var err error
 	if err = fs.Parse(args); err != nil {
 		return opts, nil, err
 	}
+	opts.changed = changedFlags(fs)
 	rest := fs.Args()
-	if len(rest) == 0 {
+	if len(rest) == 0 && opts.configFile == "" {
 		return opts, nil, fmt.Errorf("missing condition backend")
+	}
+	opts, err = applyProfileDefaults(opts)
+	if err != nil {
+		return opts, nil, err
+	}
+	if !opts.changed["output"] {
+		format = string(opts.format)
 	}
 	opts.backoff = runner.Backoff(strings.ToLower(backoff))
 	if opts.maxInterval == 0 {
@@ -294,6 +334,53 @@ func parseGlobal(args []string) (globalOptions, []string, error) {
 		return opts, nil, err
 	}
 	return opts, rest, nil
+}
+
+func changedFlags(fs *pflag.FlagSet) map[string]bool {
+	changed := map[string]bool{}
+	fs.Visit(func(flag *pflag.Flag) {
+		changed[flag.Name] = true
+	})
+	return changed
+}
+
+func applyProfileDefaults(opts globalOptions) (globalOptions, error) {
+	switch strings.TrimSpace(strings.ToLower(opts.profile)) {
+	case "":
+		return opts, nil
+	case "ci":
+		return applyCIProfileDefaults(opts), nil
+	case "local":
+		return applyLocalProfileDefaults(opts), nil
+	default:
+		return opts, fmt.Errorf("unknown profile %q", opts.profile)
+	}
+}
+
+func applyCIProfileDefaults(opts globalOptions) globalOptions {
+	if !opts.changed["timeout"] {
+		opts.timeout = 10 * time.Minute
+	}
+	if !opts.changed["interval"] {
+		opts.interval = time.Second
+	}
+	if !opts.changed["output"] {
+		opts.format = output.FormatJSON
+	}
+	return opts
+}
+
+func applyLocalProfileDefaults(opts globalOptions) globalOptions {
+	if !opts.changed["timeout"] {
+		opts.timeout = 2 * time.Minute
+	}
+	if !opts.changed["interval"] {
+		opts.interval = 500 * time.Millisecond
+	}
+	if !opts.changed["verbose"] {
+		opts.verbose = true
+	}
+	return opts
 }
 
 func parseJitter(raw string) (float64, error) {
@@ -579,6 +666,11 @@ func parseHTTPCondition(segment []string) (condition.Condition, error) {
 	jsonpath := ""
 	insecure := false
 	noRedirects := false
+	bearerToken := ""
+	basicUser := ""
+	basicPassword := ""
+	clientCert := ""
+	clientKey := ""
 	var rawHeaders []string
 	fs.StringVar(&method, "method", method, "HTTP method")
 	fs.StringVar(&status, "status", status, "expected HTTP status or class, such as 200 or 2xx")
@@ -590,6 +682,11 @@ func parseHTTPCondition(segment []string) (condition.Condition, error) {
 	fs.BoolVar(&insecure, "insecure", insecure, "skip TLS verification")
 	fs.BoolVar(&noRedirects, "no-follow-redirects", noRedirects, "do not follow HTTP redirects")
 	fs.StringArrayVar(&rawHeaders, "header", nil, "request header, as Key: Value or Key=Value")
+	fs.StringVar(&bearerToken, "bearer-token", bearerToken, "set Authorization: Bearer token")
+	fs.StringVar(&basicUser, "basic-user", basicUser, "basic auth username")
+	fs.StringVar(&basicPassword, "basic-password", basicPassword, "basic auth password")
+	fs.StringVar(&clientCert, "client-cert", clientCert, "TLS client certificate PEM file")
+	fs.StringVar(&clientKey, "client-key", clientKey, "TLS client private key PEM file")
 	if err := fs.Parse(segment[1:]); err != nil {
 		return nil, err
 	}
@@ -600,33 +697,164 @@ func parseHTTPCondition(segment []string) (condition.Condition, error) {
 	if err := validateHTTPURL(args[0]); err != nil {
 		return nil, err
 	}
-	statusMatcher, err := condition.ParseHTTPStatusMatcher(status)
+	return buildHTTPCondition(args[0], httpConditionOptions{
+		method:        method,
+		status:        status,
+		body:          body,
+		bodyFile:      bodyFile,
+		bodyContains:  bodyContains,
+		bodyMatches:   bodyMatches,
+		jsonpath:      jsonpath,
+		insecure:      insecure,
+		noRedirects:   noRedirects,
+		rawHeaders:    rawHeaders,
+		bearerToken:   bearerToken,
+		basicUser:     basicUser,
+		basicPassword: basicPassword,
+		clientCert:    clientCert,
+		clientKey:     clientKey,
+	})
+}
+
+type httpConditionOptions struct {
+	method        string
+	status        string
+	body          string
+	bodyFile      string
+	bodyContains  string
+	bodyMatches   string
+	jsonpath      string
+	insecure      bool
+	noRedirects   bool
+	rawHeaders    []string
+	bearerToken   string
+	basicUser     string
+	basicPassword string
+	clientCert    string
+	clientKey     string
+}
+
+func buildHTTPCondition(target string, opts httpConditionOptions) (condition.Condition, error) {
+	statusMatcher, err := condition.ParseHTTPStatusMatcher(opts.status)
 	if err != nil {
 		return nil, err
 	}
-	requestBody, err := parseBodyContent(body, bodyFile)
+	requestBody, err := parseBodyContent(opts.body, opts.bodyFile)
 	if err != nil {
 		return nil, err
 	}
-	bodyRegex, bodyExpr, err := compileHTTPBodyMatchers(bodyMatches, jsonpath)
+	bodyRegex, bodyExpr, err := compileHTTPBodyMatchers(opts.bodyMatches, opts.jsonpath)
 	if err != nil {
 		return nil, err
 	}
-	headers, err := parseHTTPHeaders(rawHeaders)
+	headers, err := parseHTTPHeaders(opts.rawHeaders)
 	if err != nil {
 		return nil, err
 	}
-	cond := condition.NewHTTP(args[0])
-	cond.Method = method
+	if err := applyHTTPAuthHeaders(headers, opts.bearerToken, opts.basicUser, opts.basicPassword); err != nil {
+		return nil, err
+	}
+	cert, err := loadHTTPClientCertificate(opts.clientCert, opts.clientKey)
+	if err != nil {
+		return nil, err
+	}
+	cond := condition.NewHTTP(target)
+	cond.Method = opts.method
 	cond.StatusMatcher = statusMatcher
 	cond.RequestBody = requestBody
-	cond.BodyContains = bodyContains
+	cond.BodyContains = opts.bodyContains
 	cond.BodyRegex = bodyRegex
 	cond.BodyJSONExpr = bodyExpr
-	cond.Insecure = insecure
-	cond.NoRedirects = noRedirects
+	cond.Insecure = opts.insecure
+	cond.NoRedirects = opts.noRedirects
 	cond.Headers = headers
+	cond.ClientCert = cert
 	return cond, nil
+}
+
+func applyHTTPAuthHeaders(headers map[string]string, bearerToken, basicUser, basicPassword string) error {
+	mode, err := validateHTTPAuthSelection(headers, bearerToken, basicUser, basicPassword)
+	if err != nil {
+		return err
+	}
+	if mode == "" {
+		return nil
+	}
+	if mode == "bearer" {
+		headers["Authorization"] = "Bearer " + bearerToken
+		return nil
+	}
+	applyHTTPBasicAuth(headers, basicUser, basicPassword)
+	return nil
+}
+
+func validateHTTPAuthSelection(headers map[string]string, bearerToken, basicUser, basicPassword string) (string, error) {
+	mode := httpAuthMode(bearerToken, basicUser, basicPassword)
+	if mode == "conflict" {
+		return "", fmt.Errorf("--bearer-token cannot be combined with --basic-user or --basic-password")
+	}
+	if mode == "" {
+		return "", nil
+	}
+	if headerExists(headers, "Authorization") {
+		return "", fmt.Errorf("authorization helper cannot be combined with Authorization header")
+	}
+	if mode == "incomplete-basic" {
+		return "", fmt.Errorf("--basic-user and --basic-password must be provided together")
+	}
+	return mode, nil
+}
+
+func httpAuthMode(bearerToken, basicUser, basicPassword string) string {
+	if bearerToken != "" {
+		if basicUser != "" || basicPassword != "" {
+			return "conflict"
+		}
+		return "bearer"
+	}
+	if basicUser == "" && basicPassword == "" {
+		return ""
+	}
+	if basicUser == "" || basicPassword == "" {
+		return "incomplete-basic"
+	}
+	return "basic"
+}
+
+func applyHTTPBasicAuth(headers map[string]string, basicUser, basicPassword string) {
+	token := base64.StdEncoding.EncodeToString([]byte(basicUser + ":" + basicPassword))
+	headers["Authorization"] = "Basic " + token
+}
+
+func headerExists(headers map[string]string, name string) bool {
+	for key := range headers {
+		if strings.EqualFold(key, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func loadHTTPClientCertificate(certPath, keyPath string) (*tls.Certificate, error) {
+	if certPath == "" && keyPath == "" {
+		return nil, nil
+	}
+	if certPath == "" || keyPath == "" {
+		return nil, fmt.Errorf("--client-cert and --client-key must be provided together")
+	}
+	certPEM, err := readFileLimit(certPath, maxTLSCAFileBytes)
+	if err != nil {
+		return nil, err
+	}
+	keyPEM, err := readFileLimit(keyPath, maxTLSCAFileBytes)
+	if err != nil {
+		return nil, err
+	}
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return nil, err
+	}
+	return &cert, nil
 }
 
 func parseTCPCondition(segment []string) (condition.Condition, error) {
@@ -1653,12 +1881,16 @@ func parseGRPCCondition(segment []string) (condition.Condition, error) {
 	fs := pflag.NewFlagSet("grpc", pflag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	service := ""
+	method := ""
 	status := string(condition.GRPCStatusServing)
 	useTLS := false
+	reflectService := false
 	timeoutText := ""
 	fs.StringVar(&service, "service", service, "gRPC health service name")
+	fs.StringVar(&method, "method", method, "gRPC unary method path, such as /pkg.Service/Check")
 	fs.StringVar(&status, "status", status, "expected health status: SERVING, NOT_SERVING, UNKNOWN, or SERVICE_UNKNOWN")
 	fs.BoolVar(&useTLS, "tls", useTLS, "use TLS for host:port addresses")
+	fs.BoolVar(&reflectService, "reflect", reflectService, "verify the service through gRPC reflection before checking health")
 	fs.StringVar(&timeoutText, "timeout", timeoutText, "per-attempt gRPC health check timeout")
 	if err := fs.Parse(segment[1:]); err != nil {
 		return nil, err
@@ -1668,6 +1900,8 @@ func parseGRPCCondition(segment []string) (condition.Condition, error) {
 	}
 	cond := condition.NewGRPC(fs.Args()[0])
 	cond.Service = service
+	cond.Method = method
+	cond.Reflect = reflectService
 	cond.Status = condition.GRPCServingStatus(strings.ToUpper(status))
 	cond.UseTLS = useTLS
 	if timeoutText != "" {
@@ -1687,11 +1921,17 @@ func parseWebSocketCondition(segment []string) (condition.Condition, error) {
 	contains := ""
 	matches := ""
 	timeoutText := ""
+	readTimeoutText := ""
+	ping := false
+	expectCloseCode := -1
 	headers := []string{}
 	fs.StringVar(&send, "send", send, "text message to send after connecting")
 	fs.StringVar(&contains, "contains", contains, "required text message substring")
 	fs.StringVar(&matches, "matches", matches, "required text message regex")
 	fs.StringVar(&timeoutText, "timeout", timeoutText, "per-attempt WebSocket timeout")
+	fs.BoolVar(&ping, "ping", ping, "send a WebSocket ping and wait for pong")
+	fs.IntVar(&expectCloseCode, "expect-close-code", expectCloseCode, "expected WebSocket close code; -1 disables")
+	fs.StringVar(&readTimeoutText, "read-timeout", readTimeoutText, "deadline for ping, close, and message reads")
 	fs.StringArrayVar(&headers, "header", headers, "extra HTTP header, as Key: Value or Key=Value")
 	if err := fs.Parse(segment[1:]); err != nil {
 		return nil, err
@@ -1702,26 +1942,42 @@ func parseWebSocketCondition(segment []string) (condition.Condition, error) {
 	cond := condition.NewWebSocket(fs.Args()[0])
 	cond.Send = send
 	cond.Contains = contains
-	if matches != "" {
-		re, err := regexp.Compile(matches)
-		if err != nil {
-			return nil, fmt.Errorf("invalid --matches regex: %w", err)
-		}
-		cond.Matches = re
-	}
+	cond.Ping = ping
+	cond.ExpectCloseCode = expectCloseCode
 	parsedHeaders, err := parseHTTPHeaders(headers)
 	if err != nil {
 		return nil, err
 	}
 	cond.Headers = parsedHeaders
+	if err := applyWebSocketOptionalSettings(cond, matches, timeoutText, readTimeoutText); err != nil {
+		return nil, err
+	}
+	return cond, nil
+}
+
+func applyWebSocketOptionalSettings(cond *condition.WebSocketCondition, matches, timeoutText, readTimeoutText string) error {
+	if matches != "" {
+		re, err := regexp.Compile(matches)
+		if err != nil {
+			return fmt.Errorf("invalid --matches regex: %w", err)
+		}
+		cond.Matches = re
+	}
 	if timeoutText != "" {
 		timeout, err := time.ParseDuration(timeoutText)
 		if err != nil {
-			return nil, fmt.Errorf("invalid --timeout: %w", err)
+			return fmt.Errorf("invalid --timeout: %w", err)
 		}
 		cond.AttemptTimeout = timeout
 	}
-	return cond, nil
+	if readTimeoutText != "" {
+		timeout, err := time.ParseDuration(readTimeoutText)
+		if err != nil {
+			return fmt.Errorf("invalid --read-timeout: %w", err)
+		}
+		cond.ReadTimeout = timeout
+	}
+	return nil
 }
 
 func validDockerStatus(status string) bool {
@@ -2269,11 +2525,94 @@ func reportFromOutcome(out runner.Outcome) output.Report {
 			ElapsedSeconds: output.Seconds(rec.Elapsed),
 			Detail:         rec.Detail,
 			LastError:      rec.LastError,
+			Reason:         conditionReason(rec),
+			Suggestion:     conditionSuggestion(out.Status, rec),
 			Fatal:          rec.Fatal,
 			Guard:          rec.Guard,
 		})
 	}
 	return report
+}
+
+func conditionReason(rec runner.ConditionResult) string {
+	text := strings.ToLower(rec.LastError + " " + rec.Detail)
+	switch rec.Backend {
+	case "docker":
+		return dockerReason(text)
+	case "process", "pidfile":
+		return missingOrWrongStateReason(text)
+	case "systemd", "launchd":
+		return serviceManagerReason(text)
+	case "k8s":
+		return kubernetesReason(text)
+	default:
+		return genericReason(rec)
+	}
+}
+
+func dockerReason(text string) string {
+	if strings.Contains(text, "not found") || strings.Contains(text, "no such") {
+		return "missing"
+	}
+	if strings.Contains(text, "health") {
+		return "unhealthy"
+	}
+	return "wrong_state"
+}
+
+func missingOrWrongStateReason(text string) string {
+	if strings.Contains(text, "does not exist") || strings.Contains(text, "not found") {
+		return "missing"
+	}
+	return "wrong_state"
+}
+
+func serviceManagerReason(text string) string {
+	if strings.Contains(text, "command not found") || strings.Contains(text, "not found") || strings.Contains(text, "unavailable") {
+		return "tool_unavailable"
+	}
+	return "wrong_state"
+}
+
+func kubernetesReason(text string) string {
+	if strings.Contains(text, "forbidden") || strings.Contains(text, "unauthorized") {
+		return "auth"
+	}
+	if strings.Contains(text, "not found") {
+		return "missing"
+	}
+	return "wrong_state"
+}
+
+func genericReason(rec runner.ConditionResult) string {
+	if rec.Fatal {
+		return "fatal"
+	}
+	if !rec.Satisfied {
+		return "unsatisfied"
+	}
+	return ""
+}
+
+func conditionSuggestion(status runner.Status, rec runner.ConditionResult) string {
+	if status != runner.StatusTimeout || rec.Satisfied {
+		return ""
+	}
+	if rec.LastError != "" {
+		return "rerun with --verbose to inspect repeated errors or check the target manually"
+	}
+	switch rec.Backend {
+	case "http":
+		return "check the URL, expected status, response body matcher, and network reachability"
+	case "k8s":
+		return "inspect the resource with kubectl describe and check recent warning events"
+	case "docker":
+		return "inspect the container state with docker inspect"
+	case "log":
+		return "verify the log path, matcher, and whether --from-start or --tail is needed"
+	default:
+		return "rerun with --verbose to see every poll attempt"
+	}
 }
 
 func splitHeader(raw string) (string, string, bool) {
@@ -2337,17 +2676,26 @@ Global flags:
                            Per-attempt deadline; 0 disables (default: 0)
   --successes N            Consecutive successful checks required (default: 1)
   --stable-for duration    Required continuous success duration (default: 0)
-  --output text|json       Output format (default: text); JSON goes to stdout
+  --output text|json|ndjson
+                           Output format (default: text); machine output goes to stdout
   --mode all|any           Condition mode (default: all)
   --verbose                Show each poll attempt
+  --profile ci|local       Apply default timeout/interval/output profile
+  --config path            Load a YAML recipe file
+  --explain, --dry-run     Show the parsed plan without running checks
 
 Condition flag:
   --name label             Human-readable condition label for text and JSON output
                            For process, --name selects the executable instead.
 
 Doctor:
-  waitfor doctor [--output text|json] [--require check]
+  waitfor doctor [--output text|json] [--require check] [--backend name]
   --require check          Require temp|shell|docker|k8s|dns-wire (repeatable or comma-separated)
+  --backend name           Include backend-specific diagnostics
+
+Help and completion:
+  waitfor help BACKEND
+  waitfor completion bash|zsh|fish
 
 HTTP:
   waitfor http [flags] URL
@@ -2359,6 +2707,11 @@ HTTP:
   --body-matches regex     Required response body regex
   --jsonpath expr          Required JSON expression on response body
   --header Key=Value       Request header (repeatable; Key: Value also accepted)
+  --bearer-token token     Set Authorization: Bearer token
+  --basic-user user        Basic auth username (requires --basic-password)
+  --basic-password value   Basic auth password (requires --basic-user)
+  --client-cert path       TLS client certificate PEM file
+  --client-key path        TLS client private key PEM file
   --insecure               Skip TLS certificate verification
   --no-follow-redirects    Do not follow HTTP redirects
 
@@ -2473,10 +2826,10 @@ ICMP:
   waitfor icmp HOST [--count N] [--timeout DURATION]
 
 gRPC:
-  waitfor grpc ADDRESS [--service NAME] [--status SERVING|NOT_SERVING|UNKNOWN|SERVICE_UNKNOWN] [--tls] [--timeout DURATION]
+  waitfor grpc ADDRESS [--service NAME] [--method /pkg.Service/Method] [--reflect] [--status SERVING|NOT_SERVING|UNKNOWN|SERVICE_UNKNOWN] [--tls] [--timeout DURATION]
 
 WebSocket:
-  waitfor websocket ws://HOST/PATH [--send TEXT] [--contains TEXT|--matches REGEX] [--header Key=Value] [--timeout DURATION]
+  waitfor websocket ws://HOST/PATH [--send TEXT] [--contains TEXT|--matches REGEX] [--ping] [--expect-close-code N] [--read-timeout DURATION] [--header Key=Value] [--timeout DURATION]
 
 Exec:
   waitfor exec [flags] -- COMMAND [ARGS...]

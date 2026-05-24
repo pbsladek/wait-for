@@ -3,9 +3,15 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -41,6 +47,371 @@ func TestExecuteFileJSON(t *testing.T) {
 	if payload["satisfied"] != true {
 		t.Fatalf("satisfied = %v, want true", payload["satisfied"])
 	}
+}
+
+func TestExecuteExplainJSONDoesNotRunCondition(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{"--explain", "--output", "json", "http", "https://example.test/health", "--bearer-token", "secret-token"}, nil, &stdout, &stderr)
+	if code != ExitSatisfied {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+	}
+	if strings.Contains(stdout.String(), "secret-token") {
+		t.Fatalf("explain leaked bearer token: %s", stdout.String())
+	}
+	var payload struct {
+		Conditions []struct {
+			Backend string `json:"backend"`
+			Target  string `json:"target"`
+		} `json:"conditions"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid explain JSON: %v", err)
+	}
+	if len(payload.Conditions) != 1 || payload.Conditions[0].Backend != "http" {
+		t.Fatalf("conditions = %+v", payload.Conditions)
+	}
+}
+
+func TestExecuteNDJSONOutput(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ready")
+	if err := os.WriteFile(path, []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{"--output", "ndjson", "file", path, "--exists"}, nil, &stdout, &stderr)
+	if code != ExitSatisfied {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+	}
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("ndjson lines = %q", stdout.String())
+	}
+	var first map[string]any
+	var last map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
+		t.Fatalf("first line JSON: %v", err)
+	}
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &last); err != nil {
+		t.Fatalf("last line JSON: %v", err)
+	}
+	if first["event"] != "start" || last["event"] != "outcome" {
+		t.Fatalf("events first=%v last=%v", first["event"], last["event"])
+	}
+}
+
+func TestExecuteConfigRecipeExplain(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "waitfor.yaml")
+	body := []byte(`
+timeout: 10m
+mode: all
+conditions:
+  - name: api
+    http:
+      url: https://api.example.com/health
+      status: 200
+  - name: rollout
+    k8s:
+      resource: deployment/api
+      for: rollout
+guards:
+  - log:
+      path: /var/log/app.log
+      matches: "FATAL|panic"
+`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{"--config", path, "--explain", "--output", "json"}, nil, &stdout, &stderr)
+	if code != ExitSatisfied {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+	}
+	var payload struct {
+		TimeoutSeconds float64 `json:"timeout_seconds"`
+		Conditions     []struct {
+			Name  string `json:"name"`
+			Guard bool   `json:"guard"`
+		} `json:"conditions"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("recipe explain JSON: %v", err)
+	}
+	if payload.TimeoutSeconds != 600 || len(payload.Conditions) != 3 || !payload.Conditions[2].Guard {
+		t.Fatalf("recipe explain = %+v", payload)
+	}
+}
+
+func TestHelpCompletionProfileAndDoctorBackend(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := Execute(t.Context(), []string{"help", "http"}, nil, &stdout, &stderr); code != ExitSatisfied {
+		t.Fatalf("help code = %d stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "--bearer-token") {
+		t.Fatalf("http help = %q", stdout.String())
+	}
+	stdout.Reset()
+	if code := Execute(t.Context(), []string{"completion", "fish"}, nil, &stdout, &stderr); code != ExitSatisfied {
+		t.Fatalf("completion code = %d stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "complete -c waitfor") {
+		t.Fatalf("completion = %q", stdout.String())
+	}
+	stdout.Reset()
+	if code := Execute(t.Context(), []string{"--profile", "ci", "--explain", "file", "/tmp/ready", "--exists"}, nil, &stdout, &stderr); code != ExitSatisfied {
+		t.Fatalf("profile explain code = %d stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"timeout_seconds": 600`) {
+		t.Fatalf("profile explain = %q", stdout.String())
+	}
+	stdout.Reset()
+	if code := Execute(t.Context(), []string{"doctor", "--backend", "icmp", "--output", "json"}, nil, &stdout, &stderr); code != ExitSatisfied {
+		t.Fatalf("doctor code = %d stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "backend:icmp") {
+		t.Fatalf("doctor backend output = %q", stdout.String())
+	}
+}
+
+func TestCompletionHelpers(t *testing.T) {
+	tests := []struct {
+		shell string
+		want  string
+	}{
+		{"bash", "complete -W"},
+		{"zsh", "#compdef waitfor"},
+		{"fish", "complete -c waitfor"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.shell, func(t *testing.T) {
+			var stdout bytes.Buffer
+			if err := runCompletion([]string{tt.shell}, &stdout); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(stdout.String(), tt.want) || !strings.Contains(stdout.String(), "http") {
+				t.Fatalf("completion = %q", stdout.String())
+			}
+		})
+	}
+	if err := runCompletion(nil, io.Discard); err == nil {
+		t.Fatal("completion without shell succeeded")
+	}
+	if err := runCompletion([]string{"powershell"}, io.Discard); err == nil {
+		t.Fatal("unsupported shell succeeded")
+	}
+	names := backendNames()
+	if len(names) == 0 || names[0] > names[len(names)-1] || !containsString(names, "http") {
+		t.Fatalf("backend names = %v", names)
+	}
+}
+
+func TestExplainTextNDJSONAndLocalProfile(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{"--profile", "local", "--explain", "--output", "text", "file", "/tmp/ready", "--exists"}, nil, &stdout, &stderr)
+	if code != ExitSatisfied {
+		t.Fatalf("text explain code = %d stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "profile: local") || !strings.Contains(stdout.String(), "timeout: 120.000s") {
+		t.Fatalf("text explain = %q", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Execute(t.Context(), []string{"--explain", "--output", "ndjson", "file", "/tmp/ready", "--exists"}, nil, &stdout, &stderr)
+	if code != ExitSatisfied {
+		t.Fatalf("ndjson explain code = %d stderr=%q", code, stderr.String())
+	}
+	var event struct {
+		Event string `json:"event"`
+		Plan  struct {
+			Conditions []struct {
+				Backend string `json:"backend"`
+			} `json:"conditions"`
+		} `json:"plan"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &event); err != nil {
+		t.Fatalf("ndjson explain JSON: %v", err)
+	}
+	if event.Event != "explain" || len(event.Plan.Conditions) != 1 || event.Plan.Conditions[0].Backend != "file" {
+		t.Fatalf("ndjson explain = %+v", event)
+	}
+}
+
+func TestConfigRecipeFormsAndOverrides(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recipe.yaml")
+	body := []byte(`
+timeout: 5m
+interval: 2s
+max_interval: 20s
+backoff: exponential
+jitter: 10%
+attempt_timeout: 3s
+successes: 2
+stable_for: 4s
+output: ndjson
+mode: any
+verbose: true
+conditions:
+  - args: ["file", "/tmp/ready", "--exists"]
+  - name: api
+    http:
+      url: https://example.test/health
+      header: ["X-One=1", "X-Two=2"]
+      no_follow_redirects: true
+  - exec:
+      command: ["sh", "-c", "true"]
+`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Execute(t.Context(), []string{"--config", path, "--explain", "--output", "json", "--timeout", "1m"}, nil, &stdout, &stderr)
+	if code != ExitSatisfied {
+		t.Fatalf("config explain code = %d stderr=%q", code, stderr.String())
+	}
+	var plan struct {
+		TimeoutSeconds           float64 `json:"timeout_seconds"`
+		IntervalSeconds          float64 `json:"interval_seconds"`
+		MaxIntervalSeconds       float64 `json:"max_interval_seconds"`
+		Backoff                  string  `json:"backoff"`
+		Jitter                   float64 `json:"jitter"`
+		PerAttemptTimeoutSeconds float64 `json:"per_attempt_timeout_seconds"`
+		RequiredSuccesses        int     `json:"required_successes"`
+		StableForSeconds         float64 `json:"stable_for_seconds"`
+		Mode                     string  `json:"mode"`
+		Conditions               []struct {
+			Backend string `json:"backend"`
+			Name    string `json:"name"`
+		} `json:"conditions"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &plan); err != nil {
+		t.Fatalf("config explain JSON: %v", err)
+	}
+	if plan.TimeoutSeconds != 60 || plan.IntervalSeconds != 2 || plan.MaxIntervalSeconds != 20 || plan.Backoff != "exponential" || plan.Jitter != 0.1 || plan.PerAttemptTimeoutSeconds != 3 || plan.RequiredSuccesses != 2 || plan.StableForSeconds != 4 || plan.Mode != "any" {
+		t.Fatalf("plan = %+v", plan)
+	}
+	if len(plan.Conditions) != 3 || plan.Conditions[1].Name != "api" || plan.Conditions[2].Backend != "exec" {
+		t.Fatalf("conditions = %+v", plan.Conditions)
+	}
+}
+
+func TestRecipeValidationErrors(t *testing.T) {
+	tests := []string{
+		"output: xml\nconditions:\n  - args: [file, /tmp/ready, --exists]\n",
+		"mode: one\nconditions:\n  - args: [file, /tmp/ready, --exists]\n",
+		"timeout: nope\nconditions:\n  - args: [file, /tmp/ready, --exists]\n",
+		"conditions:\n  - args: [file, {bad: value}]\n",
+		"conditions:\n  - exec:\n      command: nope\n",
+	}
+	for i, body := range tests {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "bad.yaml")
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var stdout, stderr bytes.Buffer
+			if code := Execute(t.Context(), []string{"--config", path, "--explain"}, nil, &stdout, &stderr); code != ExitInvalid {
+				t.Fatalf("code = %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
+func TestConditionDiagnosticsReasonsAndSuggestions(t *testing.T) {
+	tests := []struct {
+		name string
+		rec  runner.ConditionResult
+		want string
+	}{
+		{"docker missing", runner.ConditionResult{Backend: "docker", LastError: "No such container"}, "missing"},
+		{"docker unhealthy", runner.ConditionResult{Backend: "docker", Detail: "health unhealthy"}, "unhealthy"},
+		{"process missing", runner.ConditionResult{Backend: "process", LastError: "does not exist"}, "missing"},
+		{"systemd unavailable", runner.ConditionResult{Backend: "systemd", LastError: "systemctl command not found"}, "tool_unavailable"},
+		{"k8s auth", runner.ConditionResult{Backend: "k8s", LastError: "forbidden"}, "auth"},
+		{"fatal", runner.ConditionResult{Backend: "exec", Fatal: true}, "fatal"},
+		{"unsatisfied", runner.ConditionResult{Backend: "http"}, "unsatisfied"},
+		{"satisfied", runner.ConditionResult{Backend: "http", Satisfied: true}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := conditionReason(tt.rec); got != tt.want {
+				t.Fatalf("reason = %q, want %q", got, tt.want)
+			}
+		})
+	}
+
+	suggestions := []runner.ConditionResult{
+		{Backend: "http"},
+		{Backend: "k8s"},
+		{Backend: "docker"},
+		{Backend: "log"},
+		{Backend: "tcp"},
+		{Backend: "tcp", LastError: "connection refused"},
+	}
+	for _, rec := range suggestions {
+		if got := conditionSuggestion(runner.StatusTimeout, rec); got == "" {
+			t.Fatalf("empty suggestion for %+v", rec)
+		}
+	}
+	if got := conditionSuggestion(runner.StatusSatisfied, runner.ConditionResult{Backend: "http"}); got != "" {
+		t.Fatalf("satisfied suggestion = %q", got)
+	}
+	if got := conditionSuggestion(runner.StatusTimeout, runner.ConditionResult{Backend: "http", Satisfied: true}); got != "" {
+		t.Fatalf("condition satisfied suggestion = %q", got)
+	}
+}
+
+func TestLoadHTTPClientCertificate(t *testing.T) {
+	certPEM, keyPEM := testClientCertificatePEM(t)
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "client.crt")
+	keyPath := filepath.Join(dir, "client.key")
+	if err := os.WriteFile(certPath, certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cert, err := loadHTTPClientCertificate(certPath, keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cert == nil || len(cert.Certificate) == 0 {
+		t.Fatalf("cert = %+v", cert)
+	}
+	cond, err := parseHTTPCondition([]string{"http", "https://example.test/ready", "--client-cert", certPath, "--client-key", keyPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cond.(*condition.HTTPCondition).ClientCert == nil {
+		t.Fatal("parsed HTTP condition missing client cert")
+	}
+}
+
+func testClientCertificatePEM(t *testing.T) ([]byte, []byte) {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "waitfor-test-client"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, publicKey, privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	return certPEM, keyPEM
 }
 
 func TestExecuteConditionNameJSON(t *testing.T) {
@@ -1087,7 +1458,7 @@ func TestParseJitterFraction(t *testing.T) {
 }
 
 func TestParseDoctorOptions(t *testing.T) {
-	opts, err := parseDoctorOptions([]string{"--output", "json", "--require", "docker,k8s", "--require", "dns-wire"})
+	opts, err := parseDoctorOptions([]string{"--output", "json", "--require", "docker,k8s", "--require", "dns-wire", "--backend", "docker,k8s", "--backend", "dns"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1099,6 +1470,9 @@ func TestParseDoctorOptions(t *testing.T) {
 			t.Fatalf("required[%s] = false, want true", name)
 		}
 	}
+	if strings.Join(opts.backends, ",") != "docker,k8s,dns" {
+		t.Fatalf("backends = %v", opts.backends)
+	}
 }
 
 func TestParseDoctorOptionsErrors(t *testing.T) {
@@ -1108,6 +1482,7 @@ func TestParseDoctorOptionsErrors(t *testing.T) {
 	}{
 		{name: "bad output", args: []string{"--output", "xml"}},
 		{name: "bad require", args: []string{"--require", "printer"}},
+		{name: "bad backend", args: []string{"--backend", "not-a-backend"}},
 		{name: "positional", args: []string{"extra"}},
 	}
 	for _, tt := range tests {
@@ -1115,6 +1490,20 @@ func TestParseDoctorOptionsErrors(t *testing.T) {
 			_, err := parseDoctorOptions(tt.args)
 			if err == nil {
 				t.Fatal("parseDoctorOptions() expected error, got nil")
+			}
+		})
+	}
+}
+
+func TestDoctorBackendChecks(t *testing.T) {
+	for _, backend := range []string{"docker", "k8s", "dns", "systemd", "launchd", "cosign", "icmp", "exec", "http"} {
+		t.Run(backend, func(t *testing.T) {
+			check := doctorBackendCheck(t.Context(), backend)
+			if check.Name != "backend:"+backend {
+				t.Fatalf("check name = %q", check.Name)
+			}
+			if check.Status == "" {
+				t.Fatalf("check status empty: %+v", check)
 			}
 		})
 	}
@@ -1170,7 +1559,7 @@ func TestBuildDoctorReportUsesCallerContext(t *testing.T) {
 		},
 	}}
 
-	report := buildDoctorReport(ctx, map[string]bool{"temp": true}, deps)
+	report := buildDoctorReport(ctx, map[string]bool{"temp": true}, nil, deps)
 	if report.Status != doctorOK {
 		t.Fatalf("status = %s, want ok", report.Status)
 	}
@@ -1708,4 +2097,13 @@ func TestExecuteGlobalInvalidMode(t *testing.T) {
 	if code != ExitInvalid {
 		t.Fatalf("exit code = %d, want %d, stderr = %q", code, ExitInvalid, stderr.String())
 	}
+}
+
+func containsString(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
 }

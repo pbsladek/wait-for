@@ -37,12 +37,15 @@ const (
 )
 
 type WebSocketCondition struct {
-	URL            string
-	Send           string
-	Contains       string
-	Matches        *regexp.Regexp
-	Headers        map[string]string
-	AttemptTimeout time.Duration
+	URL             string
+	Send            string
+	Contains        string
+	Matches         *regexp.Regexp
+	Headers         map[string]string
+	AttemptTimeout  time.Duration
+	Ping            bool
+	ExpectCloseCode int
+	ReadTimeout     time.Duration
 }
 
 type websocketFrame struct {
@@ -62,7 +65,7 @@ func (c *websocketConn) Read(p []byte) (int, error) {
 }
 
 func NewWebSocket(rawURL string) *WebSocketCondition {
-	return &WebSocketCondition{URL: rawURL, Headers: map[string]string{}, AttemptTimeout: 2 * time.Second}
+	return &WebSocketCondition{URL: rawURL, Headers: map[string]string{}, AttemptTimeout: 2 * time.Second, ExpectCloseCode: -1}
 }
 
 func (c *WebSocketCondition) Descriptor() Descriptor {
@@ -102,6 +105,12 @@ func validateWebSocketConfig(c *WebSocketCondition) error {
 	}
 	if c.AttemptTimeout < 0 {
 		return fmt.Errorf("--timeout must be non-negative")
+	}
+	if c.ReadTimeout < 0 {
+		return fmt.Errorf("--read-timeout must be non-negative")
+	}
+	if c.ExpectCloseCode > 65535 {
+		return fmt.Errorf("--expect-close-code must be between 0 and 65535")
 	}
 	return validateWebSocketHeaders(c.Headers)
 }
@@ -174,10 +183,7 @@ func reservedWebSocketHeader(name string) bool {
 
 func websocketRoundTrip(ctx context.Context, c *WebSocketCondition) (string, error) {
 	u, _ := url.Parse(c.URL)
-	timeout := c.AttemptTimeout
-	if timeout <= 0 {
-		timeout = 2 * time.Second
-	}
+	timeout := websocketAttemptTimeout(c.AttemptTimeout)
 	conn, err := websocketDial(ctx, u, c.Headers, timeout)
 	if err != nil {
 		return "", err
@@ -186,15 +192,67 @@ func websocketRoundTrip(ctx context.Context, c *WebSocketCondition) (string, err
 	stopCancelWatcher := closeOnContextDone(ctx, conn)
 	defer stopCancelWatcher()
 	_ = conn.SetDeadline(time.Now().Add(timeout))
-	if c.Send != "" {
-		if err := writeWebSocketText(conn, c.Send); err != nil {
-			return "", err
-		}
+	if err := writeWebSocketSend(conn, c.Send); err != nil {
+		return "", err
 	}
-	if c.Contains == "" && c.Matches == nil {
+	if err := checkWebSocketPing(conn, c.Ping, c.ReadTimeout); err != nil {
+		return "", err
+	}
+	if c.ExpectCloseCode >= 0 {
+		return "", checkWebSocketClose(conn, c.ExpectCloseCode, c.ReadTimeout)
+	}
+	return readExpectedWebSocketMessage(conn, c.Contains, c.Matches, c.ReadTimeout)
+}
+
+func websocketAttemptTimeout(timeout time.Duration) time.Duration {
+	if timeout > 0 {
+		return timeout
+	}
+	return 2 * time.Second
+}
+
+func writeWebSocketSend(conn net.Conn, message string) error {
+	if message == "" {
+		return nil
+	}
+	return writeWebSocketText(conn, message)
+}
+
+func checkWebSocketPing(conn net.Conn, enabled bool, readTimeout time.Duration) error {
+	if !enabled {
+		return nil
+	}
+	setWebSocketReadDeadline(conn, readTimeout)
+	if err := writeWebSocketPing(conn, []byte("waitfor")); err != nil {
+		return err
+	}
+	return readWebSocketPong(conn)
+}
+
+func checkWebSocketClose(conn net.Conn, expectedCode int, readTimeout time.Duration) error {
+	setWebSocketReadDeadline(conn, readTimeout)
+	code, err := readWebSocketCloseCode(conn)
+	if err != nil {
+		return err
+	}
+	if code != expectedCode {
+		return fmt.Errorf("websocket close code %d, expected %d", code, expectedCode)
+	}
+	return nil
+}
+
+func readExpectedWebSocketMessage(conn net.Conn, contains string, matches *regexp.Regexp, readTimeout time.Duration) (string, error) {
+	if contains == "" && matches == nil {
 		return "", nil
 	}
+	setWebSocketReadDeadline(conn, readTimeout)
 	return readWebSocketTextWithPong(conn, conn)
+}
+
+func setWebSocketReadDeadline(conn net.Conn, readTimeout time.Duration) {
+	if readTimeout > 0 {
+		_ = conn.SetDeadline(time.Now().Add(readTimeout))
+	}
 }
 
 func websocketDial(ctx context.Context, u *url.URL, headers map[string]string, timeout time.Duration) (net.Conn, error) {
@@ -416,6 +474,59 @@ func writeWebSocketPong(w io.Writer, payload []byte) error {
 		masked[i] = b ^ mask[i%4]
 	}
 	return writeAll(w, append(header, masked...))
+}
+
+func writeWebSocketPing(w io.Writer, payload []byte) error {
+	if len(payload) > 125 {
+		return fmt.Errorf("websocket ping payload too large")
+	}
+	header := []byte{0x89}
+	header = appendWebSocketLength(header, len(payload), true)
+	var mask [4]byte
+	if _, err := rand.Read(mask[:]); err != nil {
+		return err
+	}
+	header = append(header, mask[:]...)
+	masked := make([]byte, len(payload))
+	for i, b := range payload {
+		masked[i] = b ^ mask[i%4]
+	}
+	return writeAll(w, append(header, masked...))
+}
+
+func readWebSocketPong(r io.Reader) error {
+	for {
+		frame, err := readWebSocketFrame(r)
+		if err != nil {
+			return err
+		}
+		switch frame.opcode {
+		case websocketOpcodePong:
+			return nil
+		case websocketOpcodePing:
+			continue
+		case websocketOpcodeClose:
+			return fmt.Errorf("websocket close frame received")
+		}
+	}
+}
+
+func readWebSocketCloseCode(r io.Reader) (int, error) {
+	for {
+		frame, err := readWebSocketFrame(r)
+		if err != nil {
+			return 0, err
+		}
+		switch frame.opcode {
+		case websocketOpcodeClose:
+			if len(frame.payload) < 2 {
+				return 1005, nil
+			}
+			return int(binary.BigEndian.Uint16(frame.payload[:2])), nil
+		case websocketOpcodePing:
+			continue
+		}
+	}
 }
 
 func writeAll(w io.Writer, data []byte) error {
