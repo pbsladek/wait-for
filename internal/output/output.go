@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -12,9 +13,12 @@ import (
 type Format string
 
 const (
-	FormatText Format = "text"
-	FormatJSON Format = "json"
+	FormatText   Format = "text"
+	FormatJSON   Format = "json"
+	FormatNDJSON Format = "ndjson"
 )
+
+const maxTextFieldBytes = 512
 
 type Printer struct {
 	w       io.Writer
@@ -58,8 +62,26 @@ type ConditionReport struct {
 	ElapsedSeconds float64 `json:"elapsed_seconds"`
 	Detail         string  `json:"detail,omitempty"`
 	LastError      string  `json:"last_error,omitempty"`
+	Reason         string  `json:"reason,omitempty"`
+	Suggestion     string  `json:"suggestion,omitempty"`
 	Fatal          bool    `json:"fatal,omitempty"`
 	Guard          bool    `json:"guard,omitempty"`
+}
+
+type ndjsonEvent struct {
+	Event           string            `json:"event"`
+	Status          string            `json:"status,omitempty"`
+	ConditionCount  int               `json:"condition_count,omitempty"`
+	TimeoutSeconds  float64           `json:"timeout_seconds,omitempty"`
+	IntervalSeconds float64           `json:"interval_seconds,omitempty"`
+	Name            string            `json:"name,omitempty"`
+	Attempt         int               `json:"attempt,omitempty"`
+	Satisfied       bool              `json:"satisfied,omitempty"`
+	Detail          string            `json:"detail,omitempty"`
+	Error           string            `json:"error,omitempty"`
+	ElapsedSeconds  float64           `json:"elapsed_seconds,omitempty"`
+	Report          *Report           `json:"report,omitempty"`
+	Fields          map[string]string `json:"fields,omitempty"`
 }
 
 func NewPrinter(w io.Writer, format Format, verbose bool) *Printer {
@@ -67,6 +89,15 @@ func NewPrinter(w io.Writer, format Format, verbose bool) *Printer {
 }
 
 func (p *Printer) Start(count int, timeout time.Duration, interval time.Duration) {
+	if p.format == FormatNDJSON {
+		_ = p.writeNDJSON(ndjsonEvent{
+			Event:           "start",
+			ConditionCount:  count,
+			TimeoutSeconds:  Seconds(timeout),
+			IntervalSeconds: Seconds(interval),
+		})
+		return
+	}
 	if p.format != FormatText {
 		return
 	}
@@ -76,6 +107,18 @@ func (p *Printer) Start(count int, timeout time.Duration, interval time.Duration
 }
 
 func (p *Printer) Attempt(event Attempt) {
+	if p.format == FormatNDJSON {
+		_ = p.writeNDJSON(ndjsonEvent{
+			Event:          "attempt",
+			Name:           event.Name,
+			Attempt:        event.Attempt,
+			Satisfied:      event.Satisfied,
+			Detail:         event.Detail,
+			Error:          event.Error,
+			ElapsedSeconds: Seconds(event.Elapsed),
+		})
+		return
+	}
 	if p.format != FormatText {
 		return
 	}
@@ -85,19 +128,22 @@ func (p *Printer) Attempt(event Attempt) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if event.Satisfied {
-		_, _ = fmt.Fprintf(p.w, "[waitfor] [ok] %s (attempt %d, %.1fs) %s\n", event.Name, event.Attempt, event.Elapsed.Seconds(), event.Detail)
+		_, _ = fmt.Fprintf(p.w, "[waitfor] [ok] %s (attempt %d, %.1fs) %s\n", sanitizeTextField(event.Name), event.Attempt, event.Elapsed.Seconds(), sanitizeTextField(event.Detail))
 		return
 	}
 	if event.Error != "" {
-		_, _ = fmt.Fprintf(p.w, "[waitfor] [..] %s (attempt %d) %s\n", event.Name, event.Attempt, event.Error)
+		_, _ = fmt.Fprintf(p.w, "[waitfor] [..] %s (attempt %d) %s\n", sanitizeTextField(event.Name), event.Attempt, sanitizeTextField(event.Error))
 		return
 	}
-	_, _ = fmt.Fprintf(p.w, "[waitfor] [..] %s (attempt %d) %s\n", event.Name, event.Attempt, event.Detail)
+	_, _ = fmt.Fprintf(p.w, "[waitfor] [..] %s (attempt %d) %s\n", sanitizeTextField(event.Name), event.Attempt, sanitizeTextField(event.Detail))
 }
 
 func (p *Printer) Outcome(report Report) error {
 	if p.format == FormatJSON {
 		return WriteJSON(p.w, report)
+	}
+	if p.format == FormatNDJSON {
+		return p.writeNDJSON(ndjsonEvent{Event: "outcome", Status: report.Status, Report: &report})
 	}
 	switch report.Status {
 	case "satisfied":
@@ -114,23 +160,41 @@ func (p *Printer) Outcome(report Report) error {
 	return nil
 }
 
+func (p *Printer) writeNDJSON(event ndjsonEvent) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	enc := json.NewEncoder(p.w)
+	return enc.Encode(event)
+}
+
 func (p *Printer) printUnsatisfiedConditions(conditions []ConditionReport) {
 	for _, rec := range conditions {
 		if rec.Satisfied {
 			continue
 		}
-		_, _ = fmt.Fprintf(p.w, "[waitfor] unsatisfied: %s%s\n", rec.Name, conditionIssue(rec))
+		_, _ = fmt.Fprintf(p.w, "[waitfor] unsatisfied: %s%s\n", sanitizeTextField(rec.Name), conditionIssue(rec))
 	}
 }
 
 func conditionIssue(rec ConditionReport) string {
 	if rec.LastError != "" {
-		return ": " + rec.LastError
+		return ": " + sanitizeTextField(rec.LastError)
 	}
 	if rec.Detail != "" {
-		return ": " + rec.Detail
+		return ": " + sanitizeTextField(rec.Detail)
 	}
 	return ""
+}
+
+func sanitizeTextField(value string) string {
+	if len(value) > maxTextFieldBytes {
+		value = value[:maxTextFieldBytes] + "...(truncated)"
+	}
+	quoted := strconv.QuoteToASCII(value)
+	if len(quoted) < 2 {
+		return quoted
+	}
+	return quoted[1 : len(quoted)-1]
 }
 
 func WriteJSON(w io.Writer, report Report) error {

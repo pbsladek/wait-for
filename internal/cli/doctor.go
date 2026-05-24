@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -17,6 +16,8 @@ import (
 	"github.com/pbsladek/wait-for/internal/output"
 	"github.com/spf13/pflag"
 )
+
+const maxDoctorCommandOutput = 64 * 1024
 
 type doctorStatus string
 
@@ -45,6 +46,7 @@ type doctorReport struct {
 type doctorOptions struct {
 	format   output.Format
 	required map[string]bool
+	backends []string
 }
 
 type doctorCheckFunc func(context.Context) doctorCheck
@@ -70,7 +72,7 @@ func runDoctorWithDeps(ctx context.Context, args []string, stdout io.Writer, _ i
 	if err != nil {
 		return ExitInvalid, err
 	}
-	report := buildDoctorReport(ctx, opts.required, deps)
+	report := buildDoctorReport(ctx, opts.required, opts.backends, deps)
 	if err := writeDoctorReport(stdout, opts.format, report); err != nil {
 		return ExitFatal, err
 	}
@@ -98,10 +100,12 @@ func parseDoctorOptions(args []string) (doctorOptions, error) {
 	opts := doctorOptions{format: output.FormatText, required: map[string]bool{"temp": true}}
 	var format string
 	var required []string
+	var backends []string
 	fs := pflag.NewFlagSet("doctor", pflag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.StringVar(&format, "output", string(opts.format), "output format: text|json")
 	fs.StringArrayVar(&required, "require", nil, "required check: temp|shell|docker|k8s|dns-wire")
+	fs.StringArrayVar(&backends, "backend", nil, "include backend-specific diagnostics")
 	if err := fs.Parse(args); err != nil {
 		return opts, err
 	}
@@ -119,7 +123,29 @@ func parseDoctorOptions(args []string) (doctorOptions, error) {
 			return opts, err
 		}
 	}
+	parsedBackends, err := parseDoctorBackends(backends)
+	if err != nil {
+		return opts, err
+	}
+	opts.backends = parsedBackends
 	return opts, nil
+}
+
+func parseDoctorBackends(raw []string) ([]string, error) {
+	var backends []string
+	for _, item := range raw {
+		for _, backend := range strings.Split(item, ",") {
+			backend = strings.TrimSpace(backend)
+			if backend == "" {
+				continue
+			}
+			if !isBackend(backend) {
+				return nil, fmt.Errorf("unknown backend %q", backend)
+			}
+			backends = append(backends, backend)
+		}
+	}
+	return backends, nil
 }
 
 func requireDoctorChecks(required map[string]bool, raw string) error {
@@ -145,7 +171,7 @@ func validDoctorCheck(name string) bool {
 	}
 }
 
-func buildDoctorReport(ctx context.Context, required map[string]bool, deps doctorDeps) doctorReport {
+func buildDoctorReport(ctx context.Context, required map[string]bool, backends []string, deps doctorDeps) doctorReport {
 	version, commit := buildMetadata()
 	report := doctorReport{
 		Status:  doctorOK,
@@ -157,11 +183,49 @@ func buildDoctorReport(ctx context.Context, required map[string]bool, deps docto
 	for _, check := range deps.checks {
 		report.Checks = append(report.Checks, check(ctx))
 	}
+	for _, backend := range backends {
+		report.Checks = append(report.Checks, doctorBackendCheck(ctx, backend))
+	}
 	for i := range report.Checks {
 		report.Checks[i].Required = required[report.Checks[i].Name]
 		report.Status = combineDoctorStatus(report.Status, report.Checks[i])
 	}
 	return report
+}
+
+func doctorBackendCheck(ctx context.Context, backend string) doctorCheck {
+	switch backend {
+	case "docker":
+		check := dockerCheck(ctx)
+		check.Name = "backend:docker"
+		return check
+	case "k8s":
+		check := kubernetesCheck(ctx)
+		check.Name = "backend:k8s"
+		return check
+	case "dns":
+		return doctorCheck{Name: "backend:dns", Status: doctorOK, Detail: "system resolver available; wire resolver compiled"}
+	case "systemd":
+		return doctorExecutableCheck("backend:systemd", "systemctl")
+	case "launchd":
+		return doctorExecutableCheck("backend:launchd", "launchctl")
+	case "cosign":
+		return doctorExecutableCheck("backend:cosign", "cosign")
+	case "icmp":
+		return doctorExecutableCheck("backend:icmp", "ping")
+	case "exec":
+		return doctorExecutableCheck("backend:exec", "sh")
+	default:
+		return doctorCheck{Name: "backend:" + backend, Status: doctorOK, Detail: "no optional local dependency"}
+	}
+}
+
+func doctorExecutableCheck(name, executable string) doctorCheck {
+	path, err := exec.LookPath(executable)
+	if err != nil {
+		return doctorCheck{Name: name, Status: doctorWarn, Detail: executable + " not found"}
+	}
+	return doctorCheck{Name: name, Status: doctorOK, Detail: path}
 }
 
 func combineDoctorStatus(current doctorStatus, check doctorCheck) doctorStatus {
@@ -247,7 +311,7 @@ func runDoctorCommand(ctx context.Context, name string, args ...string) (string,
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...) // #nosec G204 -- doctor runs fixed diagnostics, not user-supplied commands.
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr doctorLimitedBuffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
@@ -263,6 +327,34 @@ func runDoctorCommand(ctx context.Context, name string, args ...string) (string,
 		return "", fmt.Errorf("%s: %s", name, detail)
 	}
 	return out, nil
+}
+
+type doctorLimitedBuffer struct {
+	data      strings.Builder
+	truncated bool
+}
+
+func (b *doctorLimitedBuffer) Write(p []byte) (int, error) {
+	remaining := maxDoctorCommandOutput - b.data.Len()
+	if remaining <= 0 {
+		b.truncated = true
+		return len(p), nil
+	}
+	if len(p) > remaining {
+		b.truncated = true
+		_, _ = b.data.Write(p[:remaining])
+		return len(p), nil
+	}
+	_, _ = b.data.Write(p)
+	return len(p), nil
+}
+
+func (b *doctorLimitedBuffer) String() string {
+	out := b.data.String()
+	if b.truncated {
+		return out + "...(truncated)"
+	}
+	return out
 }
 
 func writeDoctorReport(w io.Writer, format output.Format, report doctorReport) error {
@@ -300,5 +392,6 @@ Flags:
   --output text|json       Output format (default: text)
   --require check          Required check: temp|shell|docker|k8s|dns-wire
                            Repeatable and comma-separated values are accepted
+  --backend name           Include backend-specific diagnostics (repeatable or comma-separated)
 `
 }

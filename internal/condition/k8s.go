@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"sync"
 
@@ -16,12 +15,17 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/util/homedir"
 )
+
+const maxKubernetesSelectorItems = 1000
 
 type KubernetesGetter interface {
 	Get(ctx context.Context, resource string, namespace string) (map[string]any, error)
 	List(ctx context.Context, resource string, namespace string, selector string) ([]map[string]any, error)
+}
+
+type KubernetesDiagnosticsGetter interface {
+	WarningEvents(ctx context.Context, obj map[string]any, namespace string) ([]string, error)
 }
 
 type KubernetesCondition struct {
@@ -66,7 +70,7 @@ func (c *KubernetesCondition) Check(ctx context.Context) Result {
 		return classifyK8sGetterError(err)
 	}
 	if c.WaitFor != "" {
-		return checkK8sWaitFor(obj, c.WaitFor)
+		return enrichK8sResult(ctx, getter, obj, c.Namespace, checkK8sWaitFor(obj, c.WaitFor))
 	}
 	if c.JSONExpr != nil {
 		return checkK8sJSONExpr(obj, c.JSONExpr)
@@ -206,6 +210,9 @@ func (c *KubernetesCondition) checkSelected(ctx context.Context, getter Kubernet
 	}
 	if len(items) == 0 {
 		return Unsatisfied("no resources matched selector", errors.New("no resources matched selector"))
+	}
+	if len(items) > maxKubernetesSelectorItems {
+		return Fatal(fmt.Errorf("selector matched more than %d resources", maxKubernetesSelectorItems))
 	}
 	return checkK8sSelected(items, c.WaitFor, c.All)
 }
@@ -385,6 +392,9 @@ func checkK8sRollout(obj map[string]any) Result {
 
 func checkDeploymentRollout(obj map[string]any) Result {
 	desired := k8sInt64Default(obj, 1, "spec", "replicas")
+	if result := checkDeploymentProgressDeadline(obj); result != nil {
+		return *result
+	}
 	if result := checkObservedGeneration(obj); result != nil {
 		return *result
 	}
@@ -401,6 +411,27 @@ func checkDeploymentRollout(obj map[string]any) Result {
 		return k8sRolloutUnsatisfied("available replicas", available, desired)
 	}
 	return Satisfied(fmt.Sprintf("rollout complete: %d replicas available", available))
+}
+
+func checkDeploymentProgressDeadline(obj map[string]any) *Result {
+	conditions, ok, err := unstructured.NestedSlice(obj, "status", "conditions")
+	if err != nil || !ok {
+		return nil
+	}
+	for _, raw := range conditions {
+		cond, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		t, _, _ := unstructured.NestedString(cond, "type")
+		status, _, _ := unstructured.NestedString(cond, "status")
+		reason, _, _ := unstructured.NestedString(cond, "reason")
+		if t == "Progressing" && status == "False" && reason == "ProgressDeadlineExceeded" {
+			r := Fatal(fmt.Errorf("deployment rollout failed: %s", reason))
+			return &r
+		}
+	}
+	return nil
 }
 
 func checkStatefulSetRollout(obj map[string]any) Result {
@@ -456,6 +487,66 @@ func checkObservedGeneration(obj map[string]any) *Result {
 func k8sRolloutUnsatisfied(label string, got, want int64) Result {
 	detail := fmt.Sprintf("%s %d, expected %d", label, got, want)
 	return Unsatisfied(detail, errors.New(detail))
+}
+
+func enrichK8sResult(ctx context.Context, getter KubernetesGetter, obj map[string]any, namespace string, result Result) Result {
+	if result.Status == CheckSatisfied {
+		return result
+	}
+	diagnostics := k8sStatusDiagnostics(ctx, getter, obj, namespace)
+	if diagnostics == "" {
+		return result
+	}
+	result.Detail += diagnostics
+	if result.Err != nil {
+		result.Err = fmt.Errorf("%s", result.Detail)
+	}
+	return result
+}
+
+func k8sStatusDiagnostics(ctx context.Context, getter KubernetesGetter, obj map[string]any, namespace string) string {
+	parts := k8sConditionSummaries(obj)
+	if diagGetter, ok := getter.(KubernetesDiagnosticsGetter); ok {
+		if warnings, err := diagGetter.WarningEvents(ctx, obj, namespace); err == nil {
+			for _, warning := range warnings {
+				parts = append(parts, "warning="+warning)
+			}
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "; conditions: " + strings.Join(parts, "; ")
+}
+
+func k8sConditionSummaries(obj map[string]any) []string {
+	conditions, ok, err := unstructured.NestedSlice(obj, "status", "conditions")
+	if err != nil || !ok {
+		return nil
+	}
+	summaries := make([]string, 0, len(conditions))
+	for _, raw := range conditions {
+		cond, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		t, _, _ := unstructured.NestedString(cond, "type")
+		status, _, _ := unstructured.NestedString(cond, "status")
+		reason, _, _ := unstructured.NestedString(cond, "reason")
+		message, _, _ := unstructured.NestedString(cond, "message")
+		if t == "" {
+			continue
+		}
+		summary := t + "=" + status
+		if reason != "" {
+			summary += " reason=" + reason
+		}
+		if message != "" {
+			summary += " message=" + message
+		}
+		summaries = append(summaries, summary)
+	}
+	return summaries
 }
 
 func k8sInt64(obj map[string]any, fields ...string) int64 {
@@ -541,20 +632,61 @@ func (g *DynamicKubernetesGetter) List(ctx context.Context, resource string, nam
 	return items, nil
 }
 
-func buildKubeConfig(kubeconfig string) (*rest.Config, error) {
-	if kubeconfig != "" {
-		return clientcmd.BuildConfigFromFlags("", kubeconfig)
+func (g *DynamicKubernetesGetter) WarningEvents(ctx context.Context, obj map[string]any, namespace string) ([]string, error) {
+	uid, _, _ := unstructured.NestedString(obj, "metadata", "uid")
+	if uid == "" {
+		return nil, nil
 	}
-	if cfg, err := rest.InClusterConfig(); err == nil {
-		return cfg, nil
+	gvr := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "events"}
+	opts := v1.ListOptions{FieldSelector: "involvedObject.uid=" + uid + ",type=Warning"}
+	list, err := g.client.Resource(gvr).Namespace(namespace).List(ctx, opts)
+	if err != nil {
+		return nil, err
 	}
-	if home := homedir.HomeDir(); home != "" {
-		path := filepath.Join(home, ".kube", "config")
-		if cfg, err := clientcmd.BuildConfigFromFlags("", path); err == nil {
-			return cfg, nil
+	warnings := make([]string, 0, len(list.Items))
+	for _, item := range list.Items {
+		reason, _, _ := unstructured.NestedString(item.Object, "reason")
+		message, _, _ := unstructured.NestedString(item.Object, "message")
+		if reason == "" && message == "" {
+			continue
 		}
+		if reason != "" && message != "" {
+			warnings = append(warnings, reason+": "+message)
+			continue
+		}
+		warnings = append(warnings, reason+message)
+	}
+	return warnings, nil
+}
+
+func buildKubeConfig(kubeconfig string) (*rest.Config, error) {
+	var cfg *rest.Config
+	var err error
+	if kubeconfig != "" {
+		cfg, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+		return validateKubeConfig(cfg, err)
+	}
+	cfg, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		clientcmd.NewDefaultClientConfigLoadingRules(),
+		&clientcmd.ConfigOverrides{},
+	).ClientConfig()
+	if err == nil {
+		return validateKubeConfig(cfg, nil)
+	}
+	if cfg, err = rest.InClusterConfig(); err == nil {
+		return validateKubeConfig(cfg, nil)
 	}
 	return nil, fmt.Errorf("kubernetes config not found; set --kubeconfig or run in cluster")
+}
+
+func validateKubeConfig(cfg *rest.Config, err error) (*rest.Config, error) {
+	if err != nil {
+		return nil, err
+	}
+	if cfg.ExecProvider != nil {
+		return nil, fmt.Errorf("kubernetes exec credential plugins are not supported")
+	}
+	return cfg, nil
 }
 
 func splitKubernetesResource(resource string) (string, string, error) {
