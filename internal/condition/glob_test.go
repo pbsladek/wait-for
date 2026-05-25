@@ -180,3 +180,25 @@ func TestGlobInjectedErrorFatal(t *testing.T) {
 		t.Fatalf("status = %s, want fatal", result.Status)
 	}
 }
+
+func TestGlobAdditionalHelperBranches(t *testing.T) {
+	if matches, err := globDirectory(t.Context(), filepath.Join(t.TempDir(), "missing"), "*.done"); err != nil || len(matches) != 0 {
+		t.Fatalf("missing globDirectory matches=%v err=%v, want none", matches, err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := globDirectory(ctx, t.TempDir(), "*.done"); err == nil {
+		t.Fatal("cancelled globDirectory succeeded")
+	}
+
+	if _, err := appendGlobMatches(nil, t.TempDir(), "[", []string{"x"}); err == nil {
+		t.Fatal("invalid glob pattern succeeded")
+	}
+	if got := globSatisfiedDetail(1); got != "1 match" {
+		t.Fatalf("globSatisfiedDetail(1) = %q", got)
+	}
+	if hasGlobMeta("plain") {
+		t.Fatal("plain value reported glob meta")
+	}
+}

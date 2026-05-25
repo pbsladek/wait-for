@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -29,6 +30,17 @@ func TestExecConditionTimeoutKillsUnixProcessGroup(t *testing.T) {
 
 	if processAliveAfter(pid, time.Second) {
 		t.Fatalf("process %d survived exec timeout", pid)
+	}
+}
+
+func TestPrepareExecCommandCancelWithoutProcess(t *testing.T) {
+	cmd := exec.Command("/bin/sh", "-c", "true") // #nosec G204 -- fixed test command.
+	prepareExecCommand(cmd)
+	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setpgid {
+		t.Fatal("prepareExecCommand did not set process group")
+	}
+	if err := cmd.Cancel(); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("Cancel without process = %v, want os.ErrProcessDone", err)
 	}
 }
 

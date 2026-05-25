@@ -1,9 +1,13 @@
 package condition
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -296,6 +300,70 @@ func TestS3InvalidDirectConfigFatal(t *testing.T) {
 	}
 }
 
+func TestS3AdditionalBranches(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if result := NewS3("s3://bucket/key").Check(ctx); result.Status != CheckUnsatisfied {
+		t.Fatalf("cancelled s3 status = %s, want unsatisfied", result.Status)
+	}
+	if _, err := ParseS3URL("s3://bucket/%zz"); err == nil {
+		t.Fatal("bad escaped s3 key succeeded")
+	}
+	if err := validateS3Endpoint("http://[::1"); err == nil {
+		t.Fatal("bad endpoint URL succeeded")
+	}
+	if err := validateParsedS3Endpoint(&url.URL{}); err == nil {
+		t.Fatal("empty endpoint succeeded")
+	}
+	if err := validateParsedS3Endpoint(&url.URL{Scheme: "ftp", Host: "example.test"}); err == nil {
+		t.Fatal("bad endpoint scheme succeeded")
+	}
+	if err := validateParsedS3Endpoint(&url.URL{Scheme: "https", Host: "example.test", RawQuery: "x=1"}); err == nil {
+		t.Fatal("endpoint query succeeded")
+	}
+	if err := validateS3CredentialTransport("http://[::1", S3Credentials{AccessKeyID: "id", SecretAccessKey: "secret"}); err == nil {
+		t.Fatal("bad credential endpoint succeeded")
+	}
+	cond := NewS3("s3://bucket/key")
+	cond.EndpointURL = "http://[::1"
+	if _, err := cond.s3RequestURL(S3Target{Bucket: "bucket", Key: "key"}); err == nil {
+		t.Fatal("bad request endpoint succeeded")
+	}
+	cond = NewS3("s3://bucket/key")
+	cond.Region = ""
+	if got := cond.region(); got != "us-east-1" {
+		t.Fatalf("default region = %q", got)
+	}
+	fixed := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	cond.Now = func() time.Time { return fixed }
+	if got := cond.now(); !got.Equal(fixed) {
+		t.Fatalf("custom now = %s, want %s", got, fixed)
+	}
+	if result := checkS3Content(cancelledContext(t), strings.NewReader("ready"), "ready"); result.Status != CheckUnsatisfied {
+		t.Fatalf("cancelled content status = %s, want unsatisfied", result.Status)
+	}
+	if result := checkS3Content(t.Context(), errorReader{}, "ready"); result.Status != CheckUnsatisfied {
+		t.Fatalf("read error content status = %s, want unsatisfied", result.Status)
+	}
+	if result := checkS3Content(t.Context(), strings.NewReader(strings.Repeat("x", int(maxS3ContentBytes)+1)), "ready"); result.Status != CheckUnsatisfied {
+		t.Fatalf("oversized content status = %s, want unsatisfied", result.Status)
+	}
+	if got := s3SatisfiedDetail(S3Target{Bucket: "bucket", Key: "key"}, &S3Condition{Metadata: map[string]string{"version": "1"}}); got != "object metadata matched" {
+		t.Fatalf("metadata detail = %q", got)
+	}
+	req, err := http.NewRequest(http.MethodGet, "https://bucket.s3.us-east-1.amazonaws.com/key?bad=%zz", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := canonicalS3Query(req.URL); got != "bad=%zz" {
+		t.Fatalf("bad canonical query = %q", got)
+	}
+	req.Header.Set("X-Test", " one\t two  ")
+	if got := canonicalS3HeaderValue(req, "x-test"); got != "one two" {
+		t.Fatalf("canonical header = %q", got)
+	}
+}
+
 func TestParseS3URL(t *testing.T) {
 	target, err := ParseS3URL("s3://bucket/path/ready%20file.json")
 	if err != nil {
@@ -322,3 +390,18 @@ func TestCanonicalS3Query(t *testing.T) {
 		t.Fatalf("canonicalS3Query() = %q", got)
 	}
 }
+
+func cancelledContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	return ctx
+}
+
+type errorReader struct{}
+
+func (errorReader) Read([]byte) (int, error) {
+	return 0, errors.New("read failed")
+}
+
+var _ io.Reader = errorReader{}

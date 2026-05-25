@@ -280,3 +280,32 @@ func TestStringOrdering(t *testing.T) {
 		t.Fatal("expected error using > on string")
 	}
 }
+
+func TestAdditionalExpressionBranches(t *testing.T) {
+	doc := map[string]any{
+		"items": []any{map[string]any{"name": "first"}},
+		"num":   float64(2),
+		"bool":  true,
+	}
+	if got, ok := traverseField([]any{"not-object"}, "field"); ok || got != nil {
+		t.Fatalf("traverseField non-object = %v/%v, want missing", got, ok)
+	}
+	if got, ok := traverseIndexes(map[string]any{}, []int{0}); ok || got != nil {
+		t.Fatalf("traverseIndexes non-array = %v/%v, want missing", got, ok)
+	}
+	if got, ok := traverseIndexes([]any{"x"}, []int{-1}); ok || got != nil {
+		t.Fatalf("traverseIndexes negative = %v/%v, want missing", got, ok)
+	}
+	if got := toString(42); got != "42" {
+		t.Fatalf("toString(42) = %q", got)
+	}
+	if _, err := compareFloat64(1, 1, "~="); err == nil {
+		t.Fatal("unsupported numeric operator succeeded")
+	}
+	if ok, err := compareValues(true, "true", "=="); err != nil || ok {
+		t.Fatalf("bool/string compare = %v/%v, want false without error", ok, err)
+	}
+	if ok, _, err := MustCompile(".items[0].name == first").Evaluate(doc); err != nil || !ok {
+		t.Fatalf("indexed evaluation = %v/%v, want true", ok, err)
+	}
+}

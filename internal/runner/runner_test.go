@@ -941,3 +941,64 @@ func TestRunRejectsInvalidBackoffConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestAdditionalValidationBranches(t *testing.T) {
+	base := Config{
+		Conditions: []condition.Condition{&fakeCondition{name: "ready", satisfyAfter: 1}},
+		Timeout:    time.Second,
+		Interval:   time.Millisecond,
+	}
+	tests := []struct {
+		name  string
+		patch func(*Config)
+	}{
+		{"no conditions", func(c *Config) { c.Conditions = nil }},
+		{"zero timeout", func(c *Config) { c.Timeout = 0 }},
+		{"zero interval", func(c *Config) { c.Interval = 0; c.MaxInterval = 0 }},
+		{"negative successes", func(c *Config) { c.RequiredSuccesses = -1 }},
+		{"negative stable for", func(c *Config) { c.StableFor = -time.Millisecond }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := base
+			tt.patch(&cfg)
+			if err := ValidateConfig(cfg); err == nil {
+				t.Fatal("ValidateConfig() expected error, got nil")
+			}
+		})
+	}
+}
+
+func TestAdditionalWrapperAndResultBranches(t *testing.T) {
+	terminal := atomic.Int32{}
+	terminal.Store(int32(terminalFatal))
+	cancelled := false
+	done, recorded := resultEndsCondition(condition.Fatal(errors.New("bad")), Config{}, &ConditionResult{}, func() { cancelled = true }, &atomic.Int64{}, &terminal)
+	if !done || recorded || cancelled {
+		t.Fatalf("fatal after terminal done=%v recorded=%v cancelled=%v, want done without record", done, recorded, cancelled)
+	}
+
+	if key, ok := conditionPointerKey(valueCondition{name: "value"}); ok || key != 0 {
+		t.Fatalf("value condition key=%d ok=%v, want no pointer key", key, ok)
+	}
+
+	var wrapper condition.Condition = &passthroughWrapper{inner: &fakeCondition{name: "ready"}}
+	for i := 0; i < maxConditionUnwrapDepth+1; i++ {
+		wrapper = &passthroughWrapper{inner: wrapper}
+	}
+	if unwrapped := unwrapCondition(wrapper); unwrapped == nil {
+		t.Fatal("deep unwrap returned nil")
+	}
+}
+
+type valueCondition struct {
+	name string
+}
+
+func (c valueCondition) Descriptor() condition.Descriptor {
+	return condition.Descriptor{Name: c.name}
+}
+
+func (c valueCondition) Check(context.Context) condition.Result {
+	return condition.Unsatisfied("", errors.New("not ready"))
+}

@@ -493,6 +493,15 @@ func TestCommandBackendValidationAndArgs(t *testing.T) {
 	if err := validateCosignConfig(&CosignCondition{Target: "-keyless", Mode: CosignImage}); err == nil {
 		t.Fatal("option-like cosign target succeeded")
 	}
+	if err := validateCosignConfig(&CosignCondition{Target: "", Mode: CosignImage}); err == nil {
+		t.Fatal("blank cosign target succeeded")
+	}
+	if err := validateCosignConfig(&CosignCondition{Target: "image", Key: "-key.pem", Mode: CosignImage}); err == nil {
+		t.Fatal("option-like cosign key succeeded")
+	}
+	if err := validateCosignConfig(&CosignCondition{Target: "image", Mode: CosignMode("bundle")}); err == nil {
+		t.Fatal("bad cosign mode succeeded")
+	}
 }
 
 func TestCommandSecurityHelpers(t *testing.T) {
@@ -512,6 +521,33 @@ func TestCommandSecurityHelpers(t *testing.T) {
 	truncated := classifyLimitedCommandError(errors.New("exit status 1"), commandOutput{stdout: []byte("x"), truncated: true}, nil)
 	if truncated == nil || !strings.Contains(truncated.Error(), "truncated") {
 		t.Fatalf("error = %v, want truncation marker", truncated)
+	}
+}
+
+func TestSmallDefaultHelperBranches(t *testing.T) {
+	if got := (&HTTPCondition{}).method(); got != http.MethodGet {
+		t.Fatalf("default HTTP method = %q", got)
+	}
+	httpCond := NewHTTP("https://example.test")
+	httpCond.Method = http.MethodPost
+	if got := httpCond.method(); got != http.MethodPost {
+		t.Fatalf("explicit HTTP method = %q", got)
+	}
+	if got := (&DockerCondition{}).status(); got != "running" {
+		t.Fatalf("default docker status = %q", got)
+	}
+	dockerCond := &DockerCondition{Health: "HEALTHY"}
+	if got := dockerCond.health(); got != "healthy" {
+		t.Fatalf("docker health lower = %q", got)
+	}
+	if checkDockerStatus(DockerState{Status: "running"}, "running") != nil {
+		t.Fatal("matching docker status returned unsatisfied result")
+	}
+	if checkDockerHealth(DockerState{Status: "running", Health: &DockerHealth{Status: "starting"}}, "none") == nil {
+		t.Fatal("docker none health accepted health state")
+	}
+	if err := classifyDockerInspectError(exec.ErrNotFound, ""); !errors.Is(err, exec.ErrNotFound) {
+		t.Fatalf("classify docker missing = %v", err)
 	}
 }
 
@@ -543,6 +579,21 @@ func TestICMPArgsUseCountAndTimeout(t *testing.T) {
 	}
 	if err := validateICMPConfig(&ICMPCondition{Host: "127.0.0.1", Count: 1, AttemptTimeout: maxICMPTimeout + time.Second}); err == nil {
 		t.Fatal("oversized icmp timeout succeeded")
+	}
+	if err := validateICMPConfig(&ICMPCondition{Host: "", Count: 1}); err == nil {
+		t.Fatal("blank icmp host succeeded")
+	}
+	if err := validateICMPConfig(&ICMPCondition{Host: "127.0.0.1", Count: 0}); err == nil {
+		t.Fatal("zero icmp count succeeded")
+	}
+	if err := validateICMPConfig(&ICMPCondition{Host: "127.0.0.1", Count: 1, AttemptTimeout: -time.Second}); err == nil {
+		t.Fatal("negative icmp timeout succeeded")
+	}
+	if timeoutMillis(0) != 1000 || timeoutMillis(time.Nanosecond) != 1 {
+		t.Fatal("timeoutMillis default/minimum branch failed")
+	}
+	if timeoutSeconds(0) != 1 || timeoutSeconds(time.Millisecond) != 1 {
+		t.Fatal("timeoutSeconds default/minimum branch failed")
 	}
 }
 
@@ -1039,6 +1090,27 @@ func TestWebSocketExpectedCloseAgainstLocalServer(t *testing.T) {
 	}
 }
 
+func TestWebSocketCheckMessageMismatchBranches(t *testing.T) {
+	server := newWebSocketMessageServer(t, "cold")
+
+	contains := NewWebSocket("ws://" + strings.TrimPrefix(server.URL, "http://") + "/events")
+	contains.Contains = "ready"
+	if result := contains.Check(t.Context()); result.Status != CheckUnsatisfied {
+		t.Fatalf("contains mismatch status = %s, want unsatisfied", result.Status)
+	}
+
+	matches := NewWebSocket("ws://" + strings.TrimPrefix(server.URL, "http://") + "/events")
+	matches.Matches = regexp.MustCompile(`ready-\d+`)
+	if result := matches.Check(t.Context()); result.Status != CheckUnsatisfied {
+		t.Fatalf("regex mismatch status = %s, want unsatisfied", result.Status)
+	}
+
+	invalid := NewWebSocket("http://example.com/events")
+	if result := invalid.Check(t.Context()); result.Status != CheckFatal {
+		t.Fatalf("invalid config status = %s, want fatal", result.Status)
+	}
+}
+
 func TestWebSocketAcceptMatchesRFC6455Example(t *testing.T) {
 	got := websocketAccept("dGhlIHNhbXBsZSBub25jZQ==")
 	if got != "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" {
@@ -1073,6 +1145,15 @@ func TestWebSocketHelpers(t *testing.T) {
 	if got := websocketAddress(mustURL(t, "wss://example.com/ready")); got != "example.com:443" {
 		t.Fatalf("wss address = %q", got)
 	}
+	if got := websocketAddress(mustURL(t, "ws://example.com:8080/ready")); got != "example.com:8080" {
+		t.Fatalf("explicit address = %q", got)
+	}
+	if got := websocketAttemptTimeout(0); got != 2*time.Second {
+		t.Fatalf("default attempt timeout = %s", got)
+	}
+	if got := websocketAttemptTimeout(100 * time.Millisecond); got != 100*time.Millisecond {
+		t.Fatalf("explicit attempt timeout = %s", got)
+	}
 	if err := validateWebSocketConfig(NewWebSocket("http://example.com")); err == nil {
 		t.Fatal("invalid websocket scheme succeeded")
 	}
@@ -1088,10 +1169,33 @@ func TestWebSocketHelpers(t *testing.T) {
 	if err := validateWebSocketConfig(NewWebSocket("ws://example.com:bad/ready")); err == nil {
 		t.Fatal("websocket bad port succeeded")
 	}
+	if err := validateWebSocketURL(&url.URL{Scheme: "ws", Host: "bad host"}); err == nil {
+		t.Fatal("websocket host with space succeeded")
+	}
+	if err := validateWebSocketURL(&url.URL{Scheme: "ws", Host: "example.com:bad"}); err == nil {
+		t.Fatal("websocket raw bad port succeeded")
+	}
+	negativeAttemptTimeout := NewWebSocket("ws://example.com/ready")
+	negativeAttemptTimeout.AttemptTimeout = -time.Second
+	if err := validateWebSocketConfig(negativeAttemptTimeout); err == nil {
+		t.Fatal("negative websocket attempt timeout succeeded")
+	}
 	dup := NewWebSocket("ws://example.com/ready")
 	dup.Headers["Connection"] = "keep-alive"
 	if err := validateWebSocketConfig(dup); err == nil {
 		t.Fatal("reserved websocket header succeeded")
+	}
+	badHeader := NewWebSocket("ws://example.com/ready")
+	badHeader.Headers["Bad Header"] = "value"
+	if err := validateWebSocketConfig(badHeader); err == nil {
+		t.Fatal("invalid websocket header succeeded")
+	}
+	tooManyHeaders := NewWebSocket("ws://example.com/ready")
+	for i := 0; i <= maxWebSocketHeaderCount; i++ {
+		tooManyHeaders.Headers[fmt.Sprintf("X-Test-%d", i)] = "value"
+	}
+	if err := validateWebSocketConfig(tooManyHeaders); err == nil {
+		t.Fatal("too many websocket headers succeeded")
 	}
 	largeSend := NewWebSocket("ws://example.com/ready")
 	largeSend.Send = strings.Repeat("x", maxWebSocketSendBytes+1)
@@ -1201,6 +1305,63 @@ func TestWebSocketFragmentedTextAndControls(t *testing.T) {
 	}
 }
 
+func TestWebSocketControlFrameBranches(t *testing.T) {
+	var pong bytes.Buffer
+	pong.Write(websocketServerFrame(0x89, []byte("server-ping")))
+	pong.Write(websocketServerFrame(0x8a, []byte("client-pong")))
+	if err := readWebSocketPong(&pong); err != nil {
+		t.Fatalf("readWebSocketPong() error = %v", err)
+	}
+	if err := readWebSocketPong(bytes.NewReader(websocketServerFrame(0x88, nil))); err == nil {
+		t.Fatal("close frame was accepted as pong")
+	}
+	var closeBuf bytes.Buffer
+	closeBuf.Write(websocketServerFrame(0x89, []byte("server-ping")))
+	closeBuf.Write(websocketServerFrame(0x88, []byte{0x03, 0xe9}))
+	code, err := readWebSocketCloseCode(&closeBuf)
+	if err != nil || code != 1001 {
+		t.Fatalf("close code = %d, err = %v; want 1001, nil", code, err)
+	}
+	code, err = readWebSocketCloseCode(bytes.NewReader(websocketServerFrame(0x88, nil)))
+	if err != nil || code != 1005 {
+		t.Fatalf("empty close code = %d, err = %v; want 1005, nil", code, err)
+	}
+	if err := checkWebSocketClose(readOnlyConn{Reader: bytes.NewReader(websocketServerFrame(0x88, []byte{0x03, 0xe9}))}, 1000, 0); err == nil {
+		t.Fatal("mismatched close code succeeded")
+	}
+	if err := writeWebSocketPing(io.Discard, bytes.Repeat([]byte("x"), 126)); err == nil {
+		t.Fatal("oversized ping succeeded")
+	}
+	if err := writeWebSocketPong(nil, []byte("ignored")); err != nil {
+		t.Fatalf("nil pong writer error = %v", err)
+	}
+}
+
+func TestWebSocketFragmentStateErrorBranches(t *testing.T) {
+	state := websocketMessageState{fragmented: true}
+	if _, _, err := state.handleFrame(websocketFrame{fin: true, opcode: websocketOpcodeText, payload: []byte("again")}, nil); err == nil {
+		t.Fatal("text start during fragmented message succeeded")
+	}
+	state = websocketMessageState{}
+	if done, _, err := state.handleFrame(websocketFrame{fin: false, opcode: websocketOpcodeText, payload: []byte("rea")}, nil); done || err != nil {
+		t.Fatalf("fragment start done=%v err=%v, want false nil", done, err)
+	}
+	if done, _, err := state.handleFrame(websocketFrame{fin: false, opcode: websocketOpcodeContinuation, payload: []byte("d")}, nil); done || err != nil {
+		t.Fatalf("fragment continuation done=%v err=%v, want false nil", done, err)
+	}
+	if done, got, err := state.handleFrame(websocketFrame{fin: true, opcode: websocketOpcodeContinuation, payload: []byte("y")}, nil); !done || err != nil || got != "ready" {
+		t.Fatalf("fragment finish done=%v got=%q err=%v", done, got, err)
+	}
+	state = websocketMessageState{fragmented: true, payload: bytes.Repeat([]byte("x"), maxWebSocketMessageBytes)}
+	if _, _, err := state.handleFrame(websocketFrame{fin: false, opcode: websocketOpcodeContinuation, payload: []byte("x")}, nil); err == nil {
+		t.Fatal("oversized fragmented message succeeded")
+	}
+	state = websocketMessageState{fragmented: true}
+	if _, _, err := state.handleFrame(websocketFrame{fin: true, opcode: websocketOpcodeContinuation, payload: []byte{0xff}}, nil); err == nil {
+		t.Fatal("invalid UTF-8 fragmented message succeeded")
+	}
+}
+
 func TestWebSocketHandshakePreservesBufferedFrameBytes(t *testing.T) {
 	client, server := net.Pipe()
 	defer func() { _ = client.Close() }()
@@ -1243,6 +1404,40 @@ func TestWebSocketHandshakeRejectsOversizedHeaders(t *testing.T) {
 	}
 }
 
+func TestWebSocketHandshakeErrorBranches(t *testing.T) {
+	tests := []struct {
+		name string
+		resp string
+	}{
+		{"malformed status", "HTTP/1.1\r\n\r\n"},
+		{"bad status code", "HTTP/1.1 ok Switching Protocols\r\n\r\n"},
+		{"not switching", "HTTP/1.1 200 OK\r\n\r\n"},
+		{"missing upgrade", "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: accept\r\n\r\n"},
+		{"missing connection", "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: accept\r\n\r\n"},
+		{"accept mismatch", "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: wrong\r\n\r\n"},
+		{"malformed header", "HTTP/1.1 101 Switching Protocols\r\nBad Header\r\n\r\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := websocketHandshakeWithResponse(tt.resp); err == nil {
+				t.Fatal("handshake succeeded")
+			}
+		})
+	}
+	var tooMany strings.Builder
+	tooMany.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
+	for i := 0; i <= maxWebSocketHeaderCount; i++ {
+		_, _ = fmt.Fprintf(&tooMany, "X-Test-%d: value\r\n", i)
+	}
+	tooMany.WriteString("\r\n")
+	if _, err := readWebSocketHandshakeResponse(bufio.NewReader(strings.NewReader(tooMany.String()))); err == nil {
+		t.Fatal("handshake with too many headers succeeded")
+	}
+	if _, err := readWebSocketHandshakeResponse(bufio.NewReader(strings.NewReader("HTTP/1.1 101 Switching Protocols"))); err == nil {
+		t.Fatal("unterminated handshake succeeded")
+	}
+}
+
 func TestWebSocketRegexAndHeaderRequest(t *testing.T) {
 	cond := NewWebSocket("ws://example.com/events")
 	cond.Matches = regexp.MustCompile(`ready-\d+`)
@@ -1267,6 +1462,249 @@ func TestArchiveHeaderBudgetValidation(t *testing.T) {
 	}
 	if err := validateArchiveHeaderBudget(&tar.Header{Size: 2}, 1, maxArchiveScannedBytes-1); err == nil {
 		t.Fatal("oversized archive scan total succeeded")
+	}
+}
+
+func TestLocalBackendAdditionalBranches(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if result := NewLockfile("lock").Check(ctx); result.Status != CheckUnsatisfied {
+		t.Fatalf("cancelled lockfile status = %s, want unsatisfied", result.Status)
+	}
+	if result := NewPermission("path").Check(ctx); result.Status != CheckUnsatisfied {
+		t.Fatalf("cancelled permission status = %s, want unsatisfied", result.Status)
+	}
+
+	badLock := NewLockfile("lock")
+	badLock.OlderThan = -time.Second
+	if result := badLock.Check(t.Context()); result.Status != CheckFatal {
+		t.Fatalf("negative older-than status = %s, want fatal", result.Status)
+	}
+	badLock = NewLockfile("lock")
+	badLock.OlderThan = time.Second
+	if result := badLock.Check(t.Context()); result.Status != CheckFatal {
+		t.Fatalf("absent older-than status = %s, want fatal", result.Status)
+	}
+
+	unsupportedType := NewPermission("path")
+	unsupportedType.Type = "socket"
+	if result := unsupportedType.Check(t.Context()); result.Status != CheckFatal {
+		t.Fatalf("unsupported permission type status = %s, want fatal", result.Status)
+	}
+	missing := NewPermission(filepath.Join(t.TempDir(), "missing"))
+	missing.Type = PermissionFile
+	if result := missing.Check(t.Context()); result.Status != CheckUnsatisfied {
+		t.Fatalf("missing permission status = %s, want unsatisfied", result.Status)
+	}
+	if result := checkPermissionType("socket", 0); result.Status != CheckFatal {
+		t.Fatalf("direct unsupported permission type status = %s, want fatal", result.Status)
+	}
+}
+
+func TestPermissionOwnerMismatchBranches(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ready")
+	if err := os.WriteFile(path, []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid, gid, ok := fileOwnerIDs(info)
+	if !ok {
+		t.Skip("owner IDs unavailable on this platform")
+	}
+	wrongUID := uid + 1
+	cond := NewPermission(path)
+	cond.UID = &wrongUID
+	if result := cond.Check(t.Context()); result.Status != CheckUnsatisfied {
+		t.Fatalf("uid mismatch status = %s, want unsatisfied", result.Status)
+	}
+	wrongGID := gid + 1
+	cond = NewPermission(path)
+	cond.GID = &wrongGID
+	if result := cond.Check(t.Context()); result.Status != CheckUnsatisfied {
+		t.Fatalf("gid mismatch status = %s, want unsatisfied", result.Status)
+	}
+}
+
+func TestChecksumAdditionalBranches(t *testing.T) {
+	if err := validateChecksumConfig(&ChecksumCondition{}, ChecksumSHA256, strings.Repeat("0", 64)); err == nil {
+		t.Fatal("checksum without path succeeded")
+	}
+	if err := validateChecksumConfig(&ChecksumCondition{Path: "x"}, "md5", strings.Repeat("0", 32)); err == nil {
+		t.Fatal("unsupported checksum algorithm succeeded")
+	}
+	if err := validateChecksumConfig(&ChecksumCondition{Path: "x"}, ChecksumSHA256, ""); err == nil {
+		t.Fatal("checksum without expected value succeeded")
+	}
+	if err := validateChecksumConfig(&ChecksumCondition{Path: "x"}, ChecksumSHA256, "not-hex"); err == nil {
+		t.Fatal("invalid checksum hex succeeded")
+	}
+	if err := validateChecksumConfig(&ChecksumCondition{Path: "x"}, ChecksumSHA256, strings.Repeat("0", 40)); err == nil {
+		t.Fatal("wrong checksum length succeeded")
+	}
+	if _, _, err := resolvedChecksum(&ChecksumCondition{Algorithm: ChecksumSHA256, Expected: "sha1:" + strings.Repeat("0", 40)}); err == nil {
+		t.Fatal("checksum prefix mismatch succeeded")
+	}
+	for _, expected := range []string{strings.Repeat("0", 40), strings.Repeat("0", 128)} {
+		if _, err := inferChecksumAlgorithm(expected); err != nil {
+			t.Fatalf("inferChecksumAlgorithm(%d chars) error = %v", len(expected), err)
+		}
+	}
+	if _, err := checksumHash("md5"); err == nil {
+		t.Fatal("unsupported checksum hash succeeded")
+	}
+	if _, err := fileChecksum(t.Context(), filepath.Join(t.TempDir(), "missing"), ChecksumSHA256); err == nil {
+		t.Fatal("missing checksum file succeeded")
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := copyWithContext(ctx, io.Discard, strings.NewReader("x")); err == nil {
+		t.Fatal("cancelled copy succeeded")
+	}
+	if _, err := copyWithContext(t.Context(), errorWriter{}, strings.NewReader("x")); err == nil {
+		t.Fatal("copy write error succeeded")
+	}
+}
+
+func TestArchiveAdditionalBranches(t *testing.T) {
+	both := NewArchive("archive.zip")
+	both.Member = "bin/app"
+	both.Matches = "bin/*"
+	if err := validateArchiveConfig(both); err == nil {
+		t.Fatal("archive contains and matches succeeded")
+	}
+	badFormat := NewArchive("archive.zip")
+	badFormat.Member = "bin/app"
+	badFormat.Format = "rar"
+	if err := validateArchiveConfig(badFormat); err == nil {
+		t.Fatal("bad archive format succeeded")
+	}
+	badGlob := NewArchive("archive.zip")
+	badGlob.Matches = "["
+	if err := validateArchiveConfig(badGlob); err == nil {
+		t.Fatal("bad archive glob succeeded")
+	}
+	if _, err := archiveContains(t.Context(), badFormat); err == nil {
+		t.Fatal("unsupported archive format succeeded")
+	}
+	if got := resolveArchiveFormat("app.tar.gz", ArchiveAuto); got != ArchiveTgz {
+		t.Fatalf("tar.gz format = %s, want tgz", got)
+	}
+	path := filepath.Join(t.TempDir(), "app.zip")
+	writeZipArchive(t, path, "bin/app")
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	zipCond := NewArchive(path)
+	zipCond.Member = "bin/app"
+	if _, err := zipContains(cancelled, zipCond); err == nil {
+		t.Fatal("cancelled zip scan succeeded")
+	}
+	badTgz := filepath.Join(t.TempDir(), "bad.tgz")
+	if err := os.WriteFile(badTgz, []byte("not gzip"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tgzCond := NewArchive(badTgz)
+	tgzCond.Member = "bin/app"
+	if _, err := tarContains(t.Context(), tgzCond, true); err == nil {
+		t.Fatal("bad tgz succeeded")
+	}
+	emptyTar := filepath.Join(t.TempDir(), "empty.tar")
+	writeEmptyTarArchive(t, emptyTar)
+	tarCond := NewArchive(emptyTar)
+	tarCond.Member = "missing"
+	found, err := tarContains(t.Context(), tarCond, false)
+	if err != nil || found {
+		t.Fatalf("empty tar found=%v err=%v, want false nil", found, err)
+	}
+}
+
+func TestGRPCAdditionalBranches(t *testing.T) {
+	badConfigs := []*GRPCCondition{
+		NewGRPC(" "),
+		NewGRPC("127.0.0.1:50051"),
+		NewGRPC("127.0.0.1:50051"),
+		NewGRPC("grpc://127.0.0.1:50051"),
+		NewGRPC("127.0.0.1:50051"),
+		NewGRPC("127.0.0.1:50051"),
+		NewGRPC("127.0.0.1:50051"),
+	}
+	badConfigs[1].Status = "BROKEN"
+	badConfigs[2].AttemptTimeout = -time.Second
+	badConfigs[3].UseTLS = true
+	badConfigs[4].Service = string([]byte{0xff})
+	badConfigs[5].Service = strings.Repeat("x", maxGRPCServiceNameBytes+1)
+	badConfigs[6].Method = "Service/Method"
+	for i, cond := range badConfigs {
+		if err := validateGRPCConfig(cond); err == nil {
+			t.Fatalf("bad grpc config %d succeeded", i)
+		}
+	}
+	if got := grpcServiceFromMethod("/pkg.Service"); got != "pkg.Service" {
+		t.Fatalf("service from method = %q", got)
+	}
+	if got := grpcMethodPath(""); got != grpcHealthPath {
+		t.Fatalf("default grpc method = %q", got)
+	}
+	if got, err := grpcHealthURL("127.0.0.1:50051", "/svc.Method/Check", true); err != nil || got != "https://127.0.0.1:50051/svc.Method/Check" {
+		t.Fatalf("grpcHealthURL tls = %q, %v", got, err)
+	}
+	for _, address := range []string{"ftp://example.test", "http://example.test/path?query=1", "grpc://user@example.test:443"} {
+		if _, err := grpcHealthURL(address, "", false); err == nil {
+			t.Fatalf("grpcHealthURL(%q) succeeded", address)
+		}
+	}
+	if _, err := grpcHealthRequest(t.Context(), "bad-address", "", "", false); err == nil {
+		t.Fatal("grpc health request with bad address succeeded")
+	}
+	if _, err := grpcReflectionRequest(t.Context(), "bad-address", "svc", false); err == nil {
+		t.Fatal("grpc reflection request with bad address succeeded")
+	}
+}
+
+func TestGRPCPayloadAndProtoErrorBranches(t *testing.T) {
+	errBody := &errorReadCloser{}
+	if _, err := parseGRPCPayloadResponse(&http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/grpc"}, "Grpc-Status": []string{"0"}}, Body: errBody}); err == nil {
+		t.Fatal("grpc read error succeeded")
+	}
+	tooLarge := io.NopCloser(strings.NewReader(strings.Repeat("x", maxGRPCResponseBytes+1)))
+	if _, err := parseGRPCPayloadResponse(&http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/grpc"}, "Grpc-Status": []string{"0"}}, Body: tooLarge}); err == nil {
+		t.Fatal("oversized grpc response succeeded")
+	}
+	if _, err := parseGRPCFrame(append(grpcFrame([]byte("ok")), 'x')); err == nil {
+		t.Fatal("grpc frame with extra bytes succeeded")
+	}
+	if _, err := parseGRPCFrame([]byte{0, 0, 0, 0, 3, 'o'}); err == nil {
+		t.Fatal("truncated grpc frame succeeded")
+	}
+	if _, err := decodeGRPCHealthStatus(nil); err == nil {
+		t.Fatal("missing grpc health status succeeded")
+	}
+	if status, err := decodeGRPCHealthStatus([]byte{0x08, 0x00}); err != nil || status != GRPCStatusUnknown {
+		t.Fatalf("unknown health status = %s, err = %v", status, err)
+	}
+	if _, _, err := decodeGRPCReflectionResponse([]byte{0x08}); err == nil {
+		t.Fatal("malformed grpc reflection key succeeded")
+	}
+	if _, _, err := decodeGRPCReflectionResponse([]byte{0x08, 0x01}); err != nil {
+		t.Fatalf("reflection skip varint error = %v", err)
+	}
+	if err := parseGRPCReflectionResponse(grpcTestPayloadResponse(nil), "svc"); err == nil {
+		t.Fatal("reflection missing descriptor succeeded")
+	}
+	payload := append([]byte{0x3a}, appendProtoString(nil, 2, "not found")...)
+	if err := parseGRPCReflectionResponse(grpcTestPayloadResponse(payload), "svc"); err == nil {
+		t.Fatal("reflection error payload succeeded")
+	}
+	if _, _, err := grpcReflectionError([]byte{0x80}); err == nil {
+		t.Fatal("malformed reflection error succeeded")
+	}
+	if _, _, err := protoStringField([]byte{0x02, 'x'}); err == nil {
+		t.Fatal("malformed proto string succeeded")
+	}
+	if _, err := grpcReflectionErrorMessage([]byte{0x08}); err == nil {
+		t.Fatal("malformed reflection error field succeeded")
 	}
 }
 
@@ -1305,6 +1743,19 @@ func writeTarArchive(t *testing.T, path, name string) {
 	if _, err := writer.Write(body); err != nil {
 		t.Fatal(err)
 	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeEmptyTarArchive(t *testing.T, path string) {
+	t.Helper()
+	file, err := os.Create(path) // #nosec G304 -- test helper writes only caller-provided t.TempDir() paths.
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = file.Close() }()
+	writer := tar.NewWriter(file)
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -1390,6 +1841,16 @@ func TestNTPValidationBranches(t *testing.T) {
 	}
 	if clampInt64ToUint32(int64(^uint32(0))+1) != ^uint32(0) {
 		t.Fatal("int64 clamp did not cap max")
+	}
+	cond = NewNTP("time.example")
+	cond.AttemptTimeout = -time.Second
+	if result := cond.Check(t.Context()); result.Status != CheckFatal {
+		t.Fatalf("negative ntp timeout status = %s", result.Status)
+	}
+	fixed := time.Unix(100, 0)
+	cond.now = func() time.Time { return fixed }
+	if got := cond.clock()(); !got.Equal(fixed) {
+		t.Fatalf("custom ntp clock = %s, want %s", got, fixed)
 	}
 }
 
@@ -1495,6 +1956,62 @@ func receiveError(t *testing.T, ch <-chan error) error {
 	}
 }
 
+func newWebSocketMessageServer(t *testing.T, message string) *httptest.Server {
+	t.Helper()
+	errC := make(chan error, 8)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, rw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			errC <- err
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		if err := writeWebSocketSwitchingProtocols(rw, r); err != nil {
+			errC <- err
+			return
+		}
+		if _, err := rw.Write(websocketServerFrame(0x81, []byte(message))); err != nil {
+			errC <- err
+			return
+		}
+		errC <- rw.Flush()
+	}))
+	t.Cleanup(func() {
+		server.Close()
+		for {
+			select {
+			case err := <-errC:
+				if err != nil {
+					t.Fatal(err)
+				}
+			default:
+				return
+			}
+		}
+	})
+	return server
+}
+
+func websocketHandshakeWithResponse(response string) error {
+	client, server := net.Pipe()
+	defer func() { _ = client.Close() }()
+	done := make(chan error, 1)
+	go func() {
+		defer func() { _ = server.Close() }()
+		if _, err := http.ReadRequest(bufio.NewReader(server)); err != nil {
+			done <- err
+			return
+		}
+		_, err := io.WriteString(server, response)
+		done <- err
+	}()
+	_, err := websocketHandshake(client, mustURLNoTest("ws://example.com/events"), nil)
+	if waitErr := <-done; waitErr != nil {
+		return waitErr
+	}
+	return err
+}
+
 func writeWebSocketSwitchingProtocols(rw *bufio.ReadWriter, r *http.Request) error {
 	accept := websocketAccept(r.Header.Get("Sec-WebSocket-Key"))
 	if _, err := fmt.Fprintf(rw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", accept); err != nil {
@@ -1549,10 +2066,66 @@ func websocketServerFrame(first byte, payload []byte) []byte {
 	return append(header, payload...)
 }
 
+func mustURLNoTest(raw string) *url.URL {
+	u, err := url.Parse(raw)
+	if err != nil {
+		panic(err)
+	}
+	return u
+}
+
 type shortWriter struct{}
 
 func (shortWriter) Write([]byte) (int, error) {
 	return 0, nil
+}
+
+type errorWriter struct{}
+
+func (errorWriter) Write([]byte) (int, error) {
+	return 0, fmt.Errorf("write failed")
+}
+
+type errorReadCloser struct{}
+
+func (*errorReadCloser) Read([]byte) (int, error) {
+	return 0, fmt.Errorf("read failed")
+}
+
+func (*errorReadCloser) Close() error {
+	return nil
+}
+
+type readOnlyConn struct {
+	io.Reader
+}
+
+func (readOnlyConn) Write([]byte) (int, error) {
+	return 0, io.ErrClosedPipe
+}
+
+func (readOnlyConn) Close() error {
+	return nil
+}
+
+func (readOnlyConn) LocalAddr() net.Addr {
+	return nil
+}
+
+func (readOnlyConn) RemoteAddr() net.Addr {
+	return nil
+}
+
+func (readOnlyConn) SetDeadline(time.Time) error {
+	return nil
+}
+
+func (readOnlyConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+
+func (readOnlyConn) SetWriteDeadline(time.Time) error {
+	return nil
 }
 
 func containsArg(args []string, want string) bool {

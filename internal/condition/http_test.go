@@ -172,6 +172,76 @@ func TestHTTPConditionInvalidDirectConfigFatalBeforeRequest(t *testing.T) {
 	}
 }
 
+func TestHTTPAdditionalHelperBranches(t *testing.T) {
+	if got := (HTTPStatusMatcher{}).String(); got != "200" {
+		t.Fatalf("zero matcher string = %q, want 200", got)
+	}
+	if err := validateHTTPAuthority(&url.URL{Scheme: "http", Host: "bad host"}); err == nil {
+		t.Fatal("HTTP authority with space succeeded")
+	}
+	if err := validateHTTPAuthority(&url.URL{Scheme: "http", Host: "example.com:bad"}); err == nil {
+		t.Fatal("HTTP authority with bad port succeeded")
+	}
+	headers := map[string]string{}
+	for i := 0; i <= maxHTTPHeaderCount; i++ {
+		headers[fmt.Sprintf("X-Test-%d", i)] = "value"
+	}
+	if err := validateHTTPHeaders(headers); err == nil {
+		t.Fatal("too many HTTP headers succeeded")
+	}
+	cond := NewHTTP("https://example.test/ready")
+	cond.BodyRegex = regexp.MustCompile(`ready`)
+	if result := cond.checkResponseBody([]byte("warming"), http.StatusOK); result.Status != CheckUnsatisfied {
+		t.Fatalf("regex mismatch status = %s, want unsatisfied", result.Status)
+	}
+	cond = NewHTTP("https://example.test/ready")
+	cond.BodyJSONExpr = expr.MustCompile(".ready == true")
+	if result := cond.checkResponseBody([]byte(`{"ready":false}`), http.StatusOK); result.Status != CheckUnsatisfied {
+		t.Fatalf("json mismatch status = %s, want unsatisfied", result.Status)
+	}
+	if result := cond.checkResponseBody([]byte(`not-json`), http.StatusOK); result.Status != CheckUnsatisfied {
+		t.Fatalf("json error status = %s, want unsatisfied", result.Status)
+	}
+	defaultClient := NewHTTP("https://example.test/ready").client()
+	if defaultClient != http.DefaultClient {
+		t.Fatal("default HTTP condition did not use http.DefaultClient")
+	}
+	transport := buildHTTPTransport(false, nil)
+	if transport != http.DefaultTransport {
+		t.Fatal("default HTTP transport was not reused")
+	}
+	transport = buildHTTPTransport(true, nil)
+	if transport == http.DefaultTransport {
+		t.Fatal("insecure HTTP transport reused default transport")
+	}
+	client := &http.Client{}
+	noRedirects := NewHTTP("https://example.test/ready")
+	noRedirects.NoRedirects = true
+	configureHTTPRedirectPolicy(client, noRedirects, false)
+	if err := client.CheckRedirect(nil, nil); err != http.ErrUseLastResponse {
+		t.Fatalf("no redirect policy err = %v", err)
+	}
+}
+
+func TestHTTPRedactionBranches(t *testing.T) {
+	bad := "http://%zz"
+	if got := redactHTTPURL(bad); got != bad {
+		t.Fatalf("bad redacted URL = %q, want original", got)
+	}
+	user, pass, token := "user", "pass", "secret"
+	raw := fmt.Sprintf("https://%s:%s@example.test/path?token=%s", user, pass, token)
+	err := &url.Error{Op: "Get", URL: raw, Err: fmt.Errorf("dial %s failed for %s %s %s", raw, user, pass, token)}
+	got := redactHTTPError(err).Error()
+	for _, secret := range []string{"user", "pass", "secret"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("redacted error %q still contains %q", got, secret)
+		}
+	}
+	if sameHTTPOrigin(nil, mustParseURL(t, raw)) {
+		t.Fatal("nil origin matched")
+	}
+}
+
 func TestParseHTTPStatusMatcher(t *testing.T) {
 	tests := []struct {
 		raw  string
@@ -452,4 +522,13 @@ func TestHTTPDescriptorRedactsSensitiveURLParts(t *testing.T) {
 	if !strings.Contains(d.Target, "ready=REDACTED") {
 		t.Fatalf("Target = %q, want query values redacted", d.Target)
 	}
+}
+
+func mustParseURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed
 }

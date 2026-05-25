@@ -300,8 +300,19 @@ func TestRecipeValidationErrors(t *testing.T) {
 		"output: xml\nconditions:\n  - args: [file, /tmp/ready, --exists]\n",
 		"mode: one\nconditions:\n  - args: [file, /tmp/ready, --exists]\n",
 		"timeout: nope\nconditions:\n  - args: [file, /tmp/ready, --exists]\n",
+		"interval: nope\nconditions:\n  - args: [file, /tmp/ready, --exists]\n",
+		"max_interval: nope\nconditions:\n  - args: [file, /tmp/ready, --exists]\n",
+		"jitter: nope\nconditions:\n  - args: [file, /tmp/ready, --exists]\n",
+		"attempt_timeout: nope\nconditions:\n  - args: [file, /tmp/ready, --exists]\n",
+		"stable_for: nope\nconditions:\n  - args: [file, /tmp/ready, --exists]\n",
+		"conditions:\n  - args: [file, /tmp/ready, --exists]\nguards:\n  - args: [file, {bad: value}]\n",
 		"conditions:\n  - args: [file, {bad: value}]\n",
 		"conditions:\n  - exec:\n      command: nope\n",
+		"conditions:\n  - http: [bad]\n",
+		"conditions:\n  - name: empty\n",
+		"conditions:\n  - file:\n      path: {bad: value}\n",
+		"conditions:\n  - args: [file, /tmp/ready, --exists]\n      guard: true\n",
+		"conditions: []\n",
 	}
 	for i, body := range tests {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
@@ -314,6 +325,212 @@ func TestRecipeValidationErrors(t *testing.T) {
 				t.Fatalf("code = %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 			}
 		})
+	}
+}
+
+func TestRecipeHelperBranches(t *testing.T) {
+	opts := globalOptions{
+		timeout:           time.Minute,
+		interval:          time.Second,
+		maxInterval:       time.Second,
+		backoff:           runner.BackoffConstant,
+		requiredSuccesses: 1,
+		format:            output.FormatText,
+		mode:              runner.ModeAll,
+		changed: map[string]bool{
+			"timeout":         true,
+			"attempt-timeout": true,
+			"successes":       true,
+			"stable-for":      true,
+			"output":          true,
+			"mode":            true,
+			"verbose":         true,
+		},
+	}
+	verbose := true
+	applied, err := applyRecipeOptions(opts, recipeFile{
+		Timeout:        "1s",
+		AttemptTimeout: "2s",
+		Successes:      3,
+		StableFor:      "4s",
+		Output:         "json",
+		Mode:           "any",
+		Verbose:        &verbose,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied.timeout != opts.timeout || applied.perAttemptTimeout != opts.perAttemptTimeout || applied.requiredSuccesses != opts.requiredSuccesses || applied.stableFor != opts.stableFor || applied.format != opts.format || applied.mode != opts.mode || applied.verbose != opts.verbose {
+		t.Fatalf("changed recipe options were not preserved: before=%+v after=%+v", opts, applied)
+	}
+
+	if _, err := recipeSegments(recipeFile{Guards: []map[string]any{{"args": []any{"file", "/tmp/ready", "--exists"}}}}); err != nil {
+		t.Fatalf("guard args segment error = %v", err)
+	}
+	segment, err := recipeBackendSegment("custom", map[string]any{"target": "value", "count": 2, "enabled": true, "skip": false, "list": []any{"a", 2, map[string]any{"bad": true}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"custom", "value", "--count", "2", "--enabled", "--list", "a", "--list", "2"} {
+		if !containsString(segment, want) {
+			t.Fatalf("segment = %v, missing %q", segment, want)
+		}
+	}
+	if got, ok := stringValue(42); ok || got != "" {
+		t.Fatalf("stringValue(42) = %q, %v; want empty false", got, ok)
+	}
+	if got := boolValue("true"); got {
+		t.Fatalf("boolValue(string) = %v; want false", got)
+	}
+}
+
+func TestBackendParsersRejectUnknownFlags(t *testing.T) {
+	for backend, parser := range backendParsers {
+		t.Run(backend, func(t *testing.T) {
+			if _, err := parser([]string{backend, "--definitely-unknown"}); err == nil {
+				t.Fatal("unknown flag succeeded")
+			}
+		})
+	}
+}
+
+func TestParseConditionAdditionalBranches(t *testing.T) {
+	if _, err := parseCondition(nil); err == nil {
+		t.Fatal("empty condition succeeded")
+	}
+	if _, err := parseCondition([]string{"guard"}); err == nil {
+		t.Fatal("bare guard succeeded")
+	}
+	if _, err := parseCondition([]string{"guard", "unknown"}); err == nil {
+		t.Fatal("guard with bad backend succeeded")
+	}
+	if _, err := parseCondition([]string{"file", "--name="}); err == nil {
+		t.Fatal("empty equals name succeeded")
+	}
+	if _, err := parseCondition([]string{"file", "--name", "one", "--name=two", "/tmp/ready"}); err == nil {
+		t.Fatal("duplicate condition name succeeded")
+	}
+	cleaned, name, err := parseConditionName([]string{"exec", "--", "echo", "--name=kept"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "" || !containsString(cleaned, "--name=kept") {
+		t.Fatalf("exec command name parsing cleaned=%v name=%q", cleaned, name)
+	}
+	if !conditionNameReservedForBackend([]string{"process", "--name", "agent"}) {
+		t.Fatal("process --name was not reserved for backend parser")
+	}
+}
+
+func TestCLIHTTPBranchHelpers(t *testing.T) {
+	if err := validateHTTPURL("ftp://example.test"); err == nil {
+		t.Fatal("ftp HTTP URL succeeded")
+	}
+	if _, err := parseBodyContent("inline", "body.txt"); err == nil {
+		t.Fatal("body and body-file succeeded")
+	}
+	if _, err := parseBodyContent("", filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("missing body file succeeded")
+	}
+	headerTests := [][]string{
+		{"NoSeparator"},
+		{"Bad Header=value"},
+		{"X-Bad=\x01"},
+		{"X-One=1", "x-one=2"},
+	}
+	for _, headers := range headerTests {
+		if _, err := parseHTTPHeaders(headers); err == nil {
+			t.Fatalf("parseHTTPHeaders(%q) succeeded", headers)
+		}
+	}
+	if validHTTPHeaderName("") {
+		t.Fatal("empty header name valid")
+	}
+	if !validHTTPHeaderValue("one\ttwo") {
+		t.Fatal("tab header value invalid")
+	}
+	if _, _, err := compileHTTPBodyMatchers("[", ""); err == nil {
+		t.Fatal("bad body regex succeeded")
+	}
+	if _, _, err := compileHTTPBodyMatchers("", " "); err == nil {
+		t.Fatal("bad body jsonpath succeeded")
+	}
+	if _, err := buildHTTPCondition("https://example.test", httpConditionOptions{status: "bad"}); err == nil {
+		t.Fatal("bad HTTP status succeeded")
+	}
+	if _, err := buildHTTPCondition("https://example.test", httpConditionOptions{status: "200", body: "inline", bodyFile: "file"}); err == nil {
+		t.Fatal("bad HTTP body config succeeded")
+	}
+	if _, err := buildHTTPCondition("https://example.test", httpConditionOptions{status: "200", rawHeaders: []string{"Bad Header=value"}}); err == nil {
+		t.Fatal("bad HTTP header config succeeded")
+	}
+	authHeaders := map[string]string{"Authorization": "Bearer existing"}
+	if err := applyHTTPAuthHeaders(authHeaders, "token", "", ""); err == nil {
+		t.Fatal("authorization header conflict succeeded")
+	}
+	if mode := httpAuthMode("token", "user", "pass"); mode != "conflict" {
+		t.Fatalf("auth mode = %q, want conflict", mode)
+	}
+	if mode := httpAuthMode("", "", "pass"); mode != "incomplete-basic" {
+		t.Fatalf("auth mode = %q, want incomplete-basic", mode)
+	}
+	if _, err := loadHTTPClientCertificate("cert.pem", ""); err == nil {
+		t.Fatal("partial client certificate succeeded")
+	}
+	if _, err := loadHTTPClientCertificate(filepath.Join(t.TempDir(), "missing-cert.pem"), filepath.Join(t.TempDir(), "missing-key.pem")); err == nil {
+		t.Fatal("missing client certificate succeeded")
+	}
+}
+
+func TestCLILocalParserBranchHelpers(t *testing.T) {
+	if _, _, err := parsePortRange("bad-start-2"); err == nil {
+		t.Fatal("bad start port succeeded")
+	}
+	if _, _, err := parsePortRange("1-bad-end"); err == nil {
+		t.Fatal("bad end port succeeded")
+	}
+	if _, err := parsePortsCondition([]string{"ports", "example.test", "--range", "2-1"}); err == nil {
+		t.Fatal("invalid port range condition succeeded")
+	}
+	if _, err := parseDNSCondition([]string{"dns", "example.test", "--udp-size", "-1"}); err == nil {
+		t.Fatal("negative DNS UDP size succeeded")
+	}
+	if _, err := parseLockfileCondition([]string{"lockfile", "/tmp/app.lock", "--older-than", "nope"}); err == nil {
+		t.Fatal("bad lockfile older-than succeeded")
+	}
+	permission := condition.NewPermission("/tmp/ready")
+	if err := applyPermissionOptions(permission, "bad", -1, -1, "", "", "file"); err == nil {
+		t.Fatal("bad permission mode succeeded")
+	}
+	if err := applyPermissionOptions(permission, "", 1, -1, "1", "", "file"); err == nil {
+		t.Fatal("uid/user conflict succeeded")
+	}
+	if err := applyPermissionOptions(permission, "", -1, -1, "name", "", "file"); err == nil {
+		t.Fatal("non-numeric user succeeded")
+	}
+	if err := applyPermissionOptions(permission, "", -1, 1, "", "1", "file"); err == nil {
+		t.Fatal("gid/group conflict succeeded")
+	}
+	if err := applyPermissionOptions(permission, "", -1, -1, "", "name", "file"); err == nil {
+		t.Fatal("non-numeric group succeeded")
+	}
+	if _, err := parseNTPCondition([]string{"ntp", "time.example", "--max-offset", "nope"}); err == nil {
+		t.Fatal("bad ntp max offset succeeded")
+	}
+	if _, err := parseNTPCondition([]string{"ntp", "time.example", "--timeout", "nope"}); err == nil {
+		t.Fatal("bad ntp timeout succeeded")
+	}
+	if _, err := parseICMPCondition([]string{"icmp", "127.0.0.1", "--timeout", "nope"}); err == nil {
+		t.Fatal("bad icmp timeout succeeded")
+	}
+	if _, err := parseGRPCCondition([]string{"grpc", "127.0.0.1:50051", "--timeout", "nope"}); err == nil {
+		t.Fatal("bad grpc timeout succeeded")
+	}
+	if _, err := parseWebSocketCondition([]string{"websocket", "ws://example.test", "--timeout", "nope"}); err == nil {
+		t.Fatal("bad websocket timeout succeeded")
+	}
+	if _, err := parseWebSocketCondition([]string{"websocket", "ws://example.test", "--read-timeout", "nope"}); err == nil {
+		t.Fatal("bad websocket read timeout succeeded")
 	}
 }
 
@@ -1516,6 +1733,9 @@ func TestDoctorStatusCombination(t *testing.T) {
 	if got := combineDoctorStatus(doctorOK, doctorCheck{Status: doctorWarn, Required: true}); got != doctorFail {
 		t.Fatalf("required warning status = %s, want fail", got)
 	}
+	if got := combineDoctorStatus(doctorWarn, doctorCheck{Status: doctorOK}); got != doctorWarn {
+		t.Fatalf("existing warn status = %s, want warn", got)
+	}
 }
 
 func TestRunDoctorWithRequiredInjectedFailure(t *testing.T) {
@@ -1544,6 +1764,23 @@ func TestRunDoctorWithRequiredInjectedFailure(t *testing.T) {
 	}
 	if len(report.Checks) != 2 || !report.Checks[1].Required {
 		t.Fatalf("checks = %+v, want injected required docker check", report.Checks)
+	}
+}
+
+func TestRunDoctorAdditionalBranches(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code, err := runDoctorWithDeps(t.Context(), []string{"help"}, &stdout, &stderr, doctorDeps{})
+	if err != nil || code != ExitSatisfied || !strings.Contains(stdout.String(), "waitfor doctor") {
+		t.Fatalf("doctor help code=%d err=%v stdout=%q", code, err, stdout.String())
+	}
+	stdout.Reset()
+	code, err = runDoctorWithDeps(t.Context(), []string{"--bad"}, &stdout, &stderr, doctorDeps{})
+	if err == nil || code != ExitInvalid {
+		t.Fatalf("doctor bad option code=%d err=%v, want invalid error", code, err)
+	}
+	code, err = runDoctorWithDeps(t.Context(), []string{"--output", "json"}, errWriter{}, &stderr, doctorDeps{})
+	if err == nil || code != ExitFatal {
+		t.Fatalf("doctor write error code=%d err=%v, want fatal error", code, err)
 	}
 }
 
@@ -1599,6 +1836,7 @@ func TestRunDoctorCommandError(t *testing.T) {
 func TestDoctorLimitedBufferTruncates(t *testing.T) {
 	var buf doctorLimitedBuffer
 	_, _ = buf.Write([]byte(strings.Repeat("x", maxDoctorCommandOutput+1)))
+	_, _ = buf.Write([]byte("ignored"))
 	got := buf.String()
 	if !strings.Contains(got, "truncated") {
 		t.Fatalf("buffer suffix = %q, want truncation marker", got[len(got)-32:])
@@ -2099,6 +2337,158 @@ func TestExecuteGlobalInvalidMode(t *testing.T) {
 	}
 }
 
+func TestReadFileLimitBranches(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "body.txt")
+	if err := os.WriteFile(path, []byte("abcdef"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := readFileLimit(path, 6); err != nil || string(data) != "abcdef" {
+		t.Fatalf("readFileLimit exact = %q err=%v", data, err)
+	}
+	if _, err := readFileLimit(path, 5); err == nil {
+		t.Fatal("oversized readFileLimit succeeded")
+	}
+	if _, err := readFileLimit(filepath.Join(t.TempDir(), "missing.txt"), 10); err == nil {
+		t.Fatal("missing readFileLimit succeeded")
+	}
+	if _, err := readFileLimit(t.TempDir(), 10); err == nil {
+		t.Fatal("directory readFileLimit succeeded")
+	}
+}
+
+func TestAdditionalCLIHelperBranches(t *testing.T) {
+	if _, err := applyProfileDefaults(globalOptions{profile: "prod"}); err == nil {
+		t.Fatal("unknown profile succeeded")
+	}
+	if got, err := parseJitter("25%"); err != nil || got != 0.25 {
+		t.Fatalf("parseJitter percent = %v err=%v", got, err)
+	}
+	if _, err := parseJitter("bad%"); err == nil {
+		t.Fatal("bad percent jitter succeeded")
+	}
+	headers := map[string]string{"authorization": "Bearer x"}
+	if _, err := validateHTTPAuthSelection(headers, "new-token", "", ""); err == nil {
+		t.Fatal("authorization helper with existing header succeeded")
+	}
+	if _, err := validateHTTPAuthSelection(nil, "", "user", ""); err == nil {
+		t.Fatal("incomplete basic auth succeeded")
+	}
+	if cert, err := loadHTTPClientCertificate("", ""); err != nil || cert != nil {
+		t.Fatalf("empty client certificate = %+v err=%v, want nil", cert, err)
+	}
+	if _, err := parseTLSValidFor("-1s"); err == nil {
+		t.Fatal("negative TLS valid-for succeeded")
+	}
+	if _, err := parseTLSRootCAs(filepath.Join(t.TempDir(), "missing-ca.pem")); err == nil {
+		t.Fatal("missing TLS CA file succeeded")
+	}
+	if err := validateS3EndpointURL("https://example.test/path?x=1"); err == nil {
+		t.Fatal("S3 endpoint query succeeded")
+	}
+	t.Setenv("AWS_REGION", "us-west-2")
+	if got := defaultS3Region(); got != "us-west-2" {
+		t.Fatalf("defaultS3Region AWS_REGION = %q", got)
+	}
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "eu-central-1")
+	if got := defaultS3Region(); got != "eu-central-1" {
+		t.Fatalf("defaultS3Region AWS_DEFAULT_REGION = %q", got)
+	}
+	for _, size := range []int{-1, 65536} {
+		if _, err := checkedDNSUDPSize(size); err == nil {
+			t.Fatalf("checkedDNSUDPSize(%d) succeeded", size)
+		}
+	}
+	for raw, want := range map[string]string{
+		"po":          "pod",
+		"deployments": "deployment",
+		"sts":         "statefulset",
+		"ds":          "daemonset",
+		"jobs":        "job",
+		"Custom":      "custom",
+	} {
+		if got := normalizeKubernetesKind(raw); got != want {
+			t.Fatalf("normalizeKubernetesKind(%q) = %q, want %q", raw, got, want)
+		}
+	}
+	if kubernetesWaitSupportsKind("complete", "pod") {
+		t.Fatal("pod supported for job completion wait")
+	}
+	if isValueForPreviousFlag([]string{"--method=GET", "--"}, 1) {
+		t.Fatal("inline flag assignment treated separator as previous flag value")
+	}
+	if got := dockerReason("container health unhealthy"); got != "unhealthy" {
+		t.Fatalf("dockerReason health = %q", got)
+	}
+	if got := kubernetesReason("forbidden"); got != "auth" {
+		t.Fatalf("kubernetesReason forbidden = %q", got)
+	}
+	backends, err := parseDoctorBackends([]string{"http,dns", " file "})
+	if err != nil || !containsString(backends, "http") || !containsString(backends, "file") {
+		t.Fatalf("parseDoctorBackends = %v err=%v", backends, err)
+	}
+	if _, err := parseDoctorBackends([]string{"unknown"}); err == nil {
+		t.Fatal("unknown doctor backend succeeded")
+	}
+	required := map[string]bool{}
+	if err := requireDoctorChecks(required, "temp,,dns-wire"); err != nil || !required["temp"] || !required["dns-wire"] {
+		t.Fatalf("requireDoctorChecks required=%v err=%v", required, err)
+	}
+	if err := requireDoctorChecks(required, "bogus"); err == nil {
+		t.Fatal("bad required doctor check succeeded")
+	}
+	t.Setenv("SHELL", "/no/such/shell")
+	if check := shellCheck(t.Context()); check.Status != doctorWarn {
+		t.Fatalf("shellCheck status = %s, want warn", check.Status)
+	}
+	if err := runBackendHelp([]string{}, io.Discard); err == nil {
+		t.Fatal("backend help without backend succeeded")
+	}
+	if err := runBackendHelp([]string{"unknown"}, io.Discard); err == nil {
+		t.Fatal("unknown backend help succeeded")
+	}
+	if err := runCompletion([]string{"powershell"}, io.Discard); err == nil {
+		t.Fatal("unsupported completion shell succeeded")
+	}
+	if value, ok := conditionFlagValue([]string{"--name"}, 0, 1); ok || value != "" {
+		t.Fatalf("conditionFlagValue missing value = %q/%v, want empty false", value, ok)
+	}
+	if backends, err := parseDoctorBackends([]string{","}); err != nil || len(backends) != 0 {
+		t.Fatalf("empty doctor backends = %v err=%v, want none", backends, err)
+	}
+	if code, err := writeExplain(errWriter{}, io.Discard, globalOptions{format: output.FormatJSON}, runner.Config{}); code != ExitSatisfied || err == nil {
+		t.Fatalf("writeExplain json error code=%d err=%v, want satisfied code with write error", code, err)
+	}
+	if code, err := writeExplain(errWriter{}, io.Discard, globalOptions{format: output.FormatNDJSON}, runner.Config{}); code != ExitFatal || err == nil {
+		t.Fatalf("writeExplain ndjson error code=%d err=%v, want fatal error", code, err)
+	}
+	if role := conditionRoleForExplain(condition.NewFile("/tmp/ready", condition.FileExists)); role != condition.RoleReady {
+		t.Fatalf("conditionRoleForExplain ready = %s, want ready", role)
+	}
+	if role := conditionRoleForExplain(explainWrapper{inner: condition.NewGuard(condition.NewFile("/tmp/wrapped", condition.FileExists))}); role != condition.RoleGuard {
+		t.Fatalf("conditionRoleForExplain wrapper = %s, want guard", role)
+	}
+	wrappedGuard := condition.WithName(condition.NewGuard(condition.NewFile("/tmp/blocked", condition.FileExists)), "blocked")
+	if role := conditionRoleForExplain(wrappedGuard); role != condition.RoleGuard {
+		t.Fatalf("conditionRoleForExplain = %s, want guard", role)
+	}
+	var explainOut bytes.Buffer
+	writeExplainText(&explainOut, explainReport{
+		Mode:              "any",
+		Backoff:           "exponential",
+		Jitter:            0.1,
+		Profile:           "ci",
+		ConfigFile:        "waitfor.yaml",
+		TimeoutSeconds:    1,
+		IntervalSeconds:   0.1,
+		Conditions:        []explainConditionReport{{Backend: "file", Target: "/tmp/ready", Name: "ready"}, {Backend: "log", Target: "/tmp/app.log", Name: "guard log", Guard: true}},
+		RequiredSuccesses: 1,
+	})
+	if !strings.Contains(explainOut.String(), "jitter=0.100") || !strings.Contains(explainOut.String(), "[guard]") {
+		t.Fatalf("explain text = %q", explainOut.String())
+	}
+}
+
 func containsString(items []string, want string) bool {
 	for _, item := range items {
 		if item == want {
@@ -2106,4 +2496,26 @@ func containsString(items []string, want string) bool {
 		}
 	}
 	return false
+}
+
+type errWriter struct{}
+
+func (errWriter) Write([]byte) (int, error) {
+	return 0, fmt.Errorf("write failed")
+}
+
+type explainWrapper struct {
+	inner condition.Condition
+}
+
+func (w explainWrapper) Descriptor() condition.Descriptor {
+	return w.inner.Descriptor()
+}
+
+func (w explainWrapper) Check(ctx context.Context) condition.Result {
+	return w.inner.Check(ctx)
+}
+
+func (w explainWrapper) UnwrapCondition() condition.Condition {
+	return w.inner
 }

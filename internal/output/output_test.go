@@ -245,3 +245,14 @@ func TestSeconds(t *testing.T) {
 		t.Fatalf("Seconds(1500ms) = %v, want 1.5", got)
 	}
 }
+
+func TestSanitizeTextFieldAdditionalBranches(t *testing.T) {
+	long := strings.Repeat("x", maxTextFieldBytes+1)
+	got := sanitizeTextField(long)
+	if !strings.Contains(got, "truncated") {
+		t.Fatalf("sanitizeTextField(long) = %q, want truncation marker", got)
+	}
+	if got := sanitizeTextField("\n"); got != `\n` {
+		t.Fatalf("sanitizeTextField newline = %q", got)
+	}
+}

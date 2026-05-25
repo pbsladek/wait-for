@@ -496,11 +496,12 @@ func parseConditionName(segment []string) ([]string, string, error) {
 		}
 		arg := segment[i]
 		if arg == "--name" {
-			if i+1 >= limit {
+			value, ok := conditionFlagValue(segment, i, limit)
+			if !ok {
 				return nil, "", fmt.Errorf("--name requires a value")
 			}
 			var err error
-			name, err = setConditionName(name, segment[i+1])
+			name, err = setConditionName(name, value)
 			if err != nil {
 				return nil, "", err
 			}
@@ -518,6 +519,14 @@ func parseConditionName(segment []string) ([]string, string, error) {
 		cleaned = append(cleaned, arg)
 	}
 	return cleaned, name, nil
+}
+
+func conditionFlagValue(args []string, i, limit int) (string, bool) {
+	next := i + 1
+	if next >= limit || next >= len(args) {
+		return "", false
+	}
+	return args[next], true
 }
 
 func conditionNameReservedForBackend(segment []string) bool {
