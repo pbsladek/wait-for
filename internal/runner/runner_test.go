@@ -529,6 +529,68 @@ func TestOutcomeStatusMethods(t *testing.T) {
 	}
 }
 
+func TestOutcomeSatisfiedModes(t *testing.T) {
+	records := []ConditionResult{
+		{Name: "guard", Guard: true, Satisfied: true},
+		{Name: "ready", Satisfied: false},
+	}
+	if outcomeSatisfied(records, ModeAny) {
+		t.Fatal("ModeAny with only guard satisfied = true, want false")
+	}
+	if outcomeSatisfied(records, ModeAll) {
+		t.Fatal("ModeAll with unsatisfied ready condition = true, want false")
+	}
+	records[1].Satisfied = true
+	if !outcomeSatisfied(records, ModeAny) {
+		t.Fatal("ModeAny with ready condition satisfied = false, want true")
+	}
+	if !outcomeSatisfied(records, ModeAll) {
+		t.Fatal("ModeAll with all ready conditions satisfied = false, want true")
+	}
+}
+
+func TestCancelSatisfiedRunBranches(t *testing.T) {
+	t.Run("mode any first winner cancels", func(t *testing.T) {
+		cancelled := false
+		readyRemaining := atomic.Int64{}
+		terminal := atomic.Int32{}
+		done := cancelSatisfiedRun(Config{Mode: ModeAny}, &ConditionResult{}, func() { cancelled = true }, &readyRemaining, &terminal)
+		if !done || !cancelled || terminal.Load() != int32(terminalSatisfied) {
+			t.Fatalf("done=%v cancelled=%v terminal=%d", done, cancelled, terminal.Load())
+		}
+	})
+	t.Run("mode any later winner is already done", func(t *testing.T) {
+		cancelled := false
+		readyRemaining := atomic.Int64{}
+		terminal := atomic.Int32{}
+		terminal.Store(int32(terminalSatisfied))
+		done := cancelSatisfiedRun(Config{Mode: ModeAny}, &ConditionResult{}, func() { cancelled = true }, &readyRemaining, &terminal)
+		if !done || cancelled {
+			t.Fatalf("done=%v cancelled=%v", done, cancelled)
+		}
+	})
+	t.Run("mode all waits for remaining ready conditions", func(t *testing.T) {
+		cancelled := false
+		readyRemaining := atomic.Int64{}
+		readyRemaining.Store(2)
+		terminal := atomic.Int32{}
+		done := cancelSatisfiedRun(Config{Mode: ModeAll}, &ConditionResult{}, func() { cancelled = true }, &readyRemaining, &terminal)
+		if !done || cancelled || readyRemaining.Load() != 1 {
+			t.Fatalf("done=%v cancelled=%v remaining=%d", done, cancelled, readyRemaining.Load())
+		}
+	})
+	t.Run("mode all ignores guard for ready countdown", func(t *testing.T) {
+		cancelled := false
+		readyRemaining := atomic.Int64{}
+		readyRemaining.Store(1)
+		terminal := atomic.Int32{}
+		done := cancelSatisfiedRun(Config{Mode: ModeAll}, &ConditionResult{Guard: true}, func() { cancelled = true }, &readyRemaining, &terminal)
+		if !done || cancelled || readyRemaining.Load() != 1 {
+			t.Fatalf("done=%v cancelled=%v remaining=%d", done, cancelled, readyRemaining.Load())
+		}
+	})
+}
+
 func TestRunOnAttemptReceivesEachAttempt(t *testing.T) {
 	var events int
 	out, err := Run(t.Context(), Config{
