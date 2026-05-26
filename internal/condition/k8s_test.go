@@ -451,6 +451,10 @@ func TestKubernetesConditionPermanentGetterErrorsFatal(t *testing.T) {
 			name: "bad request",
 			err:  apierrors.NewBadRequest("invalid selector"),
 		},
+		{
+			name: "invalid",
+			err:  apierrors.NewInvalid(schema.GroupKind{Group: "", Kind: "Pod"}, "myapp", nil),
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -462,6 +466,16 @@ func TestKubernetesConditionPermanentGetterErrorsFatal(t *testing.T) {
 				t.Fatalf("status = %s, want fatal", result.Status)
 			}
 		})
+	}
+}
+
+func TestKubernetesConditionResolveGetterErrorFatal(t *testing.T) {
+	cond := NewKubernetes("pod/myapp")
+	cond.Kubeconfig = "/nonexistent/kubeconfig.yaml"
+
+	result := cond.Check(t.Context())
+	if result.Status != CheckFatal {
+		t.Fatalf("status = %s, want fatal", result.Status)
 	}
 }
 
@@ -526,6 +540,143 @@ func TestKubernetesConditionInvalidDirectConfigFatalBeforeGetter(t *testing.T) {
 				t.Fatalf("status = %s, want fatal", result.Status)
 			}
 		})
+	}
+}
+
+func TestKubernetesWaitForHelpers(t *testing.T) {
+	if validK8sWaitFor("steady") {
+		t.Fatal("steady unexpectedly valid")
+	}
+	if k8sWaitSupportsKind("steady", "pod") {
+		t.Fatal("unsupported wait type matched kind")
+	}
+	tests := map[string]string{
+		"Pods":       "pod",
+		"deploy":     "deployment",
+		"sts":        "statefulset",
+		"ds":         "daemonset",
+		"jobs":       "job",
+		"customkind": "customkind",
+	}
+	for input, want := range tests {
+		if got := normalizeK8sKind(input); got != want {
+			t.Fatalf("normalizeK8sKind(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestKubernetesWaitForAndMatcherBranches(t *testing.T) {
+	if result := checkK8sWaitFor(map[string]any{}, "steady"); result.Status != CheckFatal {
+		t.Fatalf("unsupported wait status = %s, want fatal", result.Status)
+	}
+	if result := checkK8sReady(serviceObject().Object); result.Status != CheckFatal {
+		t.Fatalf("ready service status = %s, want fatal", result.Status)
+	}
+	if result := checkK8sJobComplete(podObject("True").Object); result.Status != CheckFatal {
+		t.Fatalf("complete pod status = %s, want fatal", result.Status)
+	}
+	if result := checkK8sJobComplete(jobObject("Complete", "False").Object); result.Status != CheckUnsatisfied {
+		t.Fatalf("incomplete job status = %s, want unsatisfied", result.Status)
+	}
+	if hasK8sConditionStatus(map[string]any{"status": map[string]any{}}, "Ready", "True") {
+		t.Fatal("missing conditions matched")
+	}
+	malformed := map[string]any{"status": map[string]any{"conditions": "bad"}}
+	if result := checkK8sNamedCondition(malformed, "Ready"); result.Status != CheckFatal {
+		t.Fatalf("malformed conditions status = %s, want fatal", result.Status)
+	}
+	withNonMap := map[string]any{"status": map[string]any{"conditions": []any{"bad"}}}
+	if result := checkK8sNamedCondition(withNonMap, "Ready"); result.Status != CheckUnsatisfied {
+		t.Fatalf("non-map condition status = %s, want unsatisfied", result.Status)
+	}
+}
+
+func TestKubernetesSelectedDefaultUnsatisfiedDetail(t *testing.T) {
+	result := checkK8sSelected(nil, "ready", false)
+	if result.Status != CheckUnsatisfied || result.Detail != "no selected resources satisfied" {
+		t.Fatalf("result = %+v, want default unsatisfied detail", result)
+	}
+}
+
+func TestKubernetesRolloutUnsatisfiedBranches(t *testing.T) {
+	tests := []struct {
+		name string
+		obj  map[string]any
+		want string
+	}{
+		{"deployment updated", rolloutDeployObject(3, 3, 1, 1, 2, 2).Object, "updated replicas"},
+		{"deployment available", rolloutDeployObject(3, 3, 3, 1, 2, 2).Object, "available replicas"},
+		{"deployment no generation", rolloutDeployObject(1, 1, 0, 0, 0, 0).Object, "updated replicas"},
+		{"stateful observed", statefulSetObject(2, 2, 2, 2, 1).Object, "observed generation"},
+		{"stateful updated", statefulSetObject(2, 1, 1, 1, 1).Object, "updated replicas"},
+		{"stateful ready", statefulSetObject(2, 2, 1, 1, 1).Object, "ready replicas"},
+		{"daemon observed", daemonSetObject(3, 3, 3, 0, 2, 1).Object, "observed generation"},
+		{"daemon updated", daemonSetObject(3, 1, 1, 0, 1, 1).Object, "updated pods"},
+		{"daemon ready", daemonSetObject(3, 3, 1, 0, 1, 1).Object, "ready pods"},
+		{"daemon unavailable", daemonSetObject(3, 3, 3, 1, 1, 1).Object, "pods unavailable"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := checkK8sRollout(tt.obj)
+			if result.Status != CheckUnsatisfied || !strings.Contains(result.Detail, tt.want) {
+				t.Fatalf("result = %+v, want unsatisfied detail containing %q", result, tt.want)
+			}
+		})
+	}
+	if result := checkK8sRollout(map[string]any{"kind": "Service"}); result.Status != CheckFatal {
+		t.Fatalf("unsupported rollout status = %s, want fatal", result.Status)
+	}
+}
+
+func TestKubernetesDiagnosticsAndWarningEvents(t *testing.T) {
+	pod := podObject("False")
+	pod.Object["metadata"].(map[string]any)["uid"] = "pod-uid"
+	pod.Object["status"].(map[string]any)["conditions"] = []any{
+		"bad",
+		map[string]any{},
+		map[string]any{"type": "Ready", "status": "False", "reason": "ContainersNotReady", "message": "waiting"},
+	}
+	eventReason := warningEvent("pod-warning-a", "pod-uid", "BackOff", "")
+	eventMessage := warningEvent("pod-warning-b", "pod-uid", "", "pull failed")
+	eventBoth := warningEvent("pod-warning-c", "pod-uid", "Failed", "boom")
+	eventBlank := warningEvent("pod-warning-d", "pod-uid", "", "")
+	client := fake.NewSimpleDynamicClient(runtime.NewScheme(), pod, eventReason, eventMessage, eventBoth, eventBlank)
+	getter := NewDynamicKubernetesGetterWithClient(client)
+
+	got := k8sStatusDiagnostics(t.Context(), getter, pod.Object, "default")
+	for _, want := range []string{"Ready=False reason=ContainersNotReady message=waiting", "warning=BackOff", "warning=pull failed", "warning=Failed: boom"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("diagnostics = %q, missing %q", got, want)
+		}
+	}
+	if got := k8sStatusDiagnostics(t.Context(), &stubGetter{}, map[string]any{}, "default"); got != "" {
+		t.Fatalf("empty diagnostics = %q, want empty", got)
+	}
+	warnings, err := getter.WarningEvents(t.Context(), map[string]any{"metadata": map[string]any{}}, "default")
+	if err != nil || warnings != nil {
+		t.Fatalf("warnings without uid = %v, %v; want nil, nil", warnings, err)
+	}
+}
+
+func TestDynamicKubernetesGetterErrorBranches(t *testing.T) {
+	getter := NewDynamicKubernetesGetterWithClient(fake.NewSimpleDynamicClient(runtime.NewScheme(), podObject("True")))
+	if _, err := getter.Get(t.Context(), "pod", "default"); err == nil {
+		t.Fatal("Get accepted resource without name")
+	}
+	if _, err := getter.Get(t.Context(), "widget/name", "default"); err == nil {
+		t.Fatal("Get accepted unsupported kind")
+	}
+	if _, err := getter.Get(t.Context(), "pod/missing", "default"); err == nil {
+		t.Fatal("Get missing object succeeded")
+	}
+	if _, err := getter.List(t.Context(), "pod/name", "default", ""); err == nil {
+		t.Fatal("List accepted named resource")
+	}
+	if _, err := getter.List(t.Context(), "widget", "default", ""); err == nil {
+		t.Fatal("List accepted unsupported kind")
+	}
+	if _, err := getter.List(t.Context(), "pod", "default", ""); err != nil {
+		t.Fatalf("List pods error = %v", err)
 	}
 }
 
@@ -834,5 +985,22 @@ func nsObject() *unstructured.Unstructured {
 		},
 	}}
 	obj.SetGroupVersionKind(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Namespace"})
+	return obj
+}
+
+func warningEvent(name, uid, reason, message string) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Event",
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": "default",
+		},
+		"involvedObject": map[string]any{"uid": uid},
+		"type":           "Warning",
+		"reason":         reason,
+		"message":        message,
+	}}
+	obj.SetGroupVersionKind(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Event"})
 	return obj
 }

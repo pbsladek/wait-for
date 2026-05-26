@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -727,6 +728,180 @@ func TestDNSValidateWireQuestionRejectsTypeClassAndCount(t *testing.T) {
 	msg.Question[0].Header().Class = wdns.ClassCHAOS
 	if err := cond.validateWireQuestion(msg); err == nil {
 		t.Fatal("wrong question class succeeded")
+	}
+}
+
+func TestDNSAdditionalValidationAndEvaluateBranches(t *testing.T) {
+	bad := NewDNS("example.test")
+	bad.ResolverMode = "broken"
+	if err := bad.validate(); err == nil {
+		t.Fatal("bad resolver mode succeeded")
+	}
+	bad = NewDNS("example.test")
+	bad.AbsentMode = "gone"
+	if err := bad.validate(); err == nil {
+		t.Fatal("bad absent mode succeeded")
+	}
+	bad = NewDNS("example.test")
+	bad.Transport = "quic"
+	if err := bad.validate(); err == nil {
+		t.Fatal("bad transport succeeded")
+	}
+	bad = NewDNS("example.test")
+	bad.UDPSize = 511
+	if err := bad.validate(); err == nil {
+		t.Fatal("small UDP size succeeded")
+	}
+	bad = NewDNS("example.test")
+	bad.RecordType = DNSRecordMX
+	if _, err := bad.lookupSystemValues(t.Context()); err == nil {
+		t.Fatal("system MX lookup succeeded")
+	}
+	cond := NewDNS("example.test")
+	cond.Absent = true
+	cond.AbsentMode = DNSAbsentNXDomain
+	if result := cond.evaluate(dnsLookupResponse{NODATA: true}); result.Status != CheckUnsatisfied {
+		t.Fatalf("NXDOMAIN absent with NODATA status = %s, want unsatisfied", result.Status)
+	}
+	cond.AbsentMode = DNSAbsentNODATA
+	if result := cond.evaluate(dnsLookupResponse{NODATA: true}); result.Status != CheckSatisfied {
+		t.Fatalf("NODATA absent status = %s, want satisfied", result.Status)
+	}
+	cond = NewDNS("example.test")
+	cond.RCode = "NOERROR"
+	if result := cond.evaluate(dnsLookupResponse{RCode: "NOERROR"}); result.Status != CheckSatisfied {
+		t.Fatalf("rcode-only status = %s, want satisfied", result.Status)
+	}
+	cond = NewDNS("example.test")
+	cond.MinCount = 2
+	if result := cond.evaluate(dnsLookupResponse{Values: []string{"192.0.2.1"}, RCode: "NOERROR"}); result.Status != CheckUnsatisfied {
+		t.Fatalf("min-count status = %s, want unsatisfied", result.Status)
+	}
+	cond = NewDNS("example.test")
+	cond.Contains = "ready"
+	if result := cond.evaluate(dnsLookupResponse{Values: []string{"warming"}, RCode: "NOERROR"}); result.Status != CheckUnsatisfied {
+		t.Fatalf("contains status = %s, want unsatisfied", result.Status)
+	}
+}
+
+func TestDNSAdditionalWireHelpers(t *testing.T) {
+	cond := NewDNS("example.test")
+	cond.ResolverMode = DNSResolverWire
+	cond.Server = "127.0.0.1:53"
+	cond.WireExchange = func(context.Context, *wdns.Msg, string, string) (*wdns.Msg, error) {
+		return nil, nil
+	}
+	if _, err := cond.lookupWire(t.Context()); err == nil {
+		t.Fatal("nil wire response succeeded")
+	}
+	cond.WireExchange = func(context.Context, *wdns.Msg, string, string) (*wdns.Msg, error) {
+		msg := wdns.NewMsg("example.test.", wdns.TypeA)
+		msg.Question = nil
+		return msg, nil
+	}
+	if _, err := cond.lookupWire(t.Context()); err == nil {
+		t.Fatal("question mismatch response succeeded")
+	}
+	records := []wdns.RR{
+		testDNSCNAME("example.test.", "alias.example.test."),
+		testDNSA("alias.example.test.", "192.0.2.10"),
+		testDNSA("other.example.test.", "192.0.2.11"),
+	}
+	values := dnsValuesFromRRs(records, DNSRecordA, "example.test")
+	if len(values) != 1 || values[0] != "192.0.2.10" {
+		t.Fatalf("dnsValuesFromRRs = %v", values)
+	}
+	if got := dnsValueFromRR(testDNSPTR("ptr.example.test.", "target.example.test.")); got == "" {
+		t.Fatal("PTR fallback value empty")
+	}
+	if !dnsValuesEqual("Ns.Example.", "ns.example", DNSRecordNS) {
+		t.Fatal("NS names were not normalized")
+	}
+	if dnsValuesEqual("192.0.2.1", "192.0.2.2", DNSRecordA) {
+		t.Fatal("A values unexpectedly matched")
+	}
+	if got := dnsRCodeString(65000); got != "RCODE65000" {
+		t.Fatalf("unknown rcode = %q", got)
+	}
+	if _, ok := dnsRCodeValue("NO-SUCH-RCODE"); ok {
+		t.Fatal("unknown rcode was valid")
+	}
+}
+
+func testDNSCNAME(name, target string) wdns.RR {
+	rr := &wdns.CNAME{Hdr: wdns.Header{Name: name, Class: wdns.ClassINET}}
+	rr.Target = target
+	return rr
+}
+
+func testDNSA(name, addr string) wdns.RR {
+	rr := &wdns.A{Hdr: wdns.Header{Name: name, Class: wdns.ClassINET}}
+	rr.Addr = netip.MustParseAddr(addr)
+	return rr
+}
+
+func testDNSPTR(name, ptr string) wdns.RR {
+	rr := &wdns.PTR{Hdr: wdns.Header{Name: name, Class: wdns.ClassINET}}
+	rr.Ptr = ptr
+	return rr
+}
+
+func TestDNSAdditionalLookupBranches(t *testing.T) {
+	cond := NewDNS("example.test")
+	cond.LookupIP = func(context.Context, string, string) ([]net.IP, error) {
+		return nil, fmt.Errorf("lookup failed")
+	}
+	if _, err := cond.lookupIP(t.Context(), "ip4"); err == nil {
+		t.Fatal("lookup IP error succeeded")
+	}
+	cond.LookupCNAME = func(context.Context, string) (string, error) {
+		return "", fmt.Errorf("lookup failed")
+	}
+	if _, err := cond.lookupCNAME(t.Context()); err == nil {
+		t.Fatal("lookup CNAME error succeeded")
+	}
+	cond.LookupTXT = func(context.Context, string) ([]string, error) {
+		return nil, fmt.Errorf("lookup failed")
+	}
+	if _, err := cond.lookupTXT(t.Context()); err == nil {
+		t.Fatal("lookup TXT error succeeded")
+	}
+	cond.Server = "127.0.0.1:53"
+	if cond.resolver() == net.DefaultResolver {
+		t.Fatal("custom DNS server used default resolver")
+	}
+}
+
+func TestDNSAdditionalDefaultHelpers(t *testing.T) {
+	cond := &DNSCondition{}
+	if cond.recordType() != DNSRecordA {
+		t.Fatalf("default record type = %s", cond.recordType())
+	}
+	if cond.resolverMode() != DNSResolverSystem {
+		t.Fatalf("default resolver mode = %s", cond.resolverMode())
+	}
+	if cond.absentMode() != DNSAbsentAny {
+		t.Fatalf("default absent mode = %s", cond.absentMode())
+	}
+	if cond.transport() != DNSTransportUDP {
+		t.Fatalf("default transport = %s", cond.transport())
+	}
+	cond = NewDNS("example.test")
+	cond.RecordType = DNSRecordTXT
+	cond.ResolverMode = DNSResolverWire
+	cond.AbsentMode = DNSAbsentNODATA
+	cond.Transport = DNSTransportTCP
+	if cond.recordType() != DNSRecordTXT || cond.resolverMode() != DNSResolverWire || cond.absentMode() != DNSAbsentNODATA || cond.transport() != DNSTransportTCP {
+		t.Fatalf("explicit DNS helpers = %s/%s/%s/%s", cond.recordType(), cond.resolverMode(), cond.absentMode(), cond.transport())
+	}
+	if !ValidDNSRCode(" noerror ") {
+		t.Fatal("trimmed/lowercase rcode was invalid")
+	}
+	if systemSupportsRecordType(DNSRecordMX) {
+		t.Fatal("system resolver unexpectedly supports MX")
+	}
+	if validDNSRecordType("NOPE") || validDNSAbsentMode("gone") || validDNSTransport("tls") {
+		t.Fatal("invalid DNS enum helper accepted value")
 	}
 }
 

@@ -2,6 +2,7 @@ package condition
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -176,5 +177,29 @@ func TestFileDescriptor(t *testing.T) {
 	}
 	if d.Name != "" {
 		t.Fatalf("Name = %q, want empty backend default", d.Name)
+	}
+}
+
+func TestFileAdditionalHelperBranches(t *testing.T) {
+	if result := checkFileStatError(nil); result.Status != CheckSatisfied {
+		t.Fatalf("checkFileStatError(nil) status = %s, want satisfied", result.Status)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if result := checkFileContent(ctx, filepath.Join(t.TempDir(), "missing"), "needle"); result.Status != CheckUnsatisfied {
+		t.Fatalf("cancelled checkFileContent status = %s, want unsatisfied", result.Status)
+	}
+	if _, err := streamFileContainsLimit(t.Context(), filepath.Join(t.TempDir(), "missing"), []byte("needle"), 1); err == nil {
+		t.Fatal("streamFileContainsLimit on missing file succeeded")
+	}
+	if found, err := readerContainsLimit(ctx, strings.NewReader("needle"), []byte("needle"), 10); err == nil || found {
+		t.Fatalf("cancelled readerContainsLimit found=%v err=%v, want cancellation", found, err)
+	}
+	if got := trailingWindow([]byte("abc"), []byte("def"), 0); got != nil {
+		t.Fatalf("trailingWindow n=0 = %q, want nil", got)
+	}
+	if got := trailingBytes([]byte("abc"), 0); got != nil {
+		t.Fatalf("trailingBytes n=0 = %q, want nil", got)
 	}
 }

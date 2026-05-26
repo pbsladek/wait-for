@@ -135,6 +135,47 @@ func TestSSHDescriptor(t *testing.T) {
 	}
 }
 
+func TestSSHAdditionalHelperBranches(t *testing.T) {
+	cond := NewSSH("127.0.0.1:22")
+	cond.Dial = func(context.Context, string) (net.Conn, error) {
+		return nil, fmt.Errorf("dial failed")
+	}
+	if result := cond.Check(t.Context()); result.Status != CheckUnsatisfied {
+		t.Fatalf("dial failure status = %s, want unsatisfied", result.Status)
+	}
+
+	if validSSHBanner("SSH-2.0-bad\x01") {
+		t.Fatal("banner with control character was valid")
+	}
+	if validSSHBanner(strings.Repeat("x", maxSSHBannerBytes+1)) {
+		t.Fatal("oversized banner was valid")
+	}
+	if validSSHBanner("NOTICE") {
+		t.Fatal("non-SSH banner was valid")
+	}
+
+	conn := readOnlyConn{Reader: strings.NewReader(strings.Repeat("notice\n", maxSSHBannerLines))}
+	if _, err := readSSHBanner(t.Context(), conn); err == nil {
+		t.Fatal("readSSHBanner without banner succeeded")
+	}
+
+	callback := (&SSHCondition{}).hostKeyCallback()
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := ssh.NewSignerFromKey(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := callback("", nil, signer.PublicKey()); err == nil {
+		t.Fatal("missing host key callback accepted key")
+	}
+	if got := normalizeSSHHostKeySHA256("abc"); got != "SHA256:abc" {
+		t.Fatalf("normalizeSSHHostKeySHA256 = %q", got)
+	}
+}
+
 func startSSHBannerServer(t *testing.T, banner string) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

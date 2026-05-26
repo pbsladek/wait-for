@@ -215,6 +215,40 @@ func TestLogAndMatchersAllMustPass(t *testing.T) {
 	}
 }
 
+func TestLogAdditionalHelperBranches(t *testing.T) {
+	if complete, err := scanLogLines(t.Context(), append(make([]byte, maxLogScanBytes+1), '\n'), func([]byte) {}); err == nil || complete {
+		t.Fatalf("oversized scanLogLines complete=%v err=%v, want error", complete, err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if complete, err := scanLogLines(ctx, []byte("ready\n"), func([]byte) {}); err != nil || complete {
+		t.Fatalf("cancelled scanLogLines complete=%v err=%v, want incomplete without error", complete, err)
+	}
+
+	dir := t.TempDir()
+	c := NewLog(dir)
+	c.Contains = "ready"
+	if _, err := c.readNewContent(mustStat(t, dir)); err == nil {
+		t.Fatal("readNewContent on directory succeeded")
+	}
+	if _, err := computeTailOffset(dir, 1, 1); err == nil {
+		t.Fatal("computeTailOffset on directory succeeded")
+	}
+	if off, err := computeTailOffset(filepath.Join(dir, "missing.log"), 12, 0); err != nil || off != 12 {
+		t.Fatalf("computeTailOffset zero lines = %d err=%v, want size", off, err)
+	}
+}
+
+func mustStat(t *testing.T, path string) os.FileInfo {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info
+}
+
 // ── matched line in detail ────────────────────────────────────────────────────
 
 func TestLogMatchedLineDetailDoesNotExposeLine(t *testing.T) {
